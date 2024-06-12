@@ -324,11 +324,11 @@ void get_next_word (hashcat_ctx_t *hashcat_ctx, HCFILE *fp, char **out_buf, u32 
       if (rule_len_out < 0) continue;
     }
 
-    if (len > PW_MAX) continue;
+    if (((len << 1) + 18) > PW_MAX) continue;
 
     // Addend '\x00' and add salt
     ptr[len++] = '\0';
-    memcpy(ptr + len, "{your_salt_here}", 16);
+        memcpy(ptr + len, "{your_salt_here}", 16);
     memcpy(ptr + len + 16, ptr, len);
     len += 16 + len;
 
