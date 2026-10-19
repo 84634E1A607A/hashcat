@@ -4264,6 +4264,8 @@ int run_kernel_mp (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, 
       }
 
       if (hc_mtlSetCommandEncoderArg (hashcat_ctx, device_param, metal_command_encoder, 0, 9, NULL, device_param->kernel_params_mp_l[9], sizeof (u64)) == -1) return hc_mtlEncodeComputeCommand_abort (hashcat_ctx, device_param, metal_command_encoder, metal_command_buffer);
+
+      if (hc_mtlSetCommandEncoderArg (hashcat_ctx, device_param, metal_command_encoder, 0, 10, NULL, device_param->kernel_params_mp_l[10], sizeof (u32)) == -1) return hc_mtlEncodeComputeCommand_abort (hashcat_ctx, device_param, metal_command_encoder, metal_command_buffer);
     }
 
     num_elements = round_up_multiple_32 (num_elements, kernel_threads);
@@ -4304,6 +4306,7 @@ int run_kernel_mp (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, 
                           if (hc_clSetKernelArg (hashcat_ctx, opencl_kernel, 7, sizeof (cl_uint),  device_param->kernel_params_mp_l[7]) == -1) return -1;
                           if (hc_clSetKernelArg (hashcat_ctx, opencl_kernel, 8, sizeof (cl_uint),  device_param->kernel_params_mp_l[8]) == -1) return -1;
                           if (hc_clSetKernelArg (hashcat_ctx, opencl_kernel, 9, sizeof (cl_ulong), device_param->kernel_params_mp_l[9]) == -1) return -1;
+                          if (hc_clSetKernelArg (hashcat_ctx, opencl_kernel, 10, sizeof (cl_uint), device_param->kernel_params_mp_l[10]) == -1) return -1;
                           break;
     }
 
@@ -5006,7 +5009,7 @@ int run_copy (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, const
 // shared by every salt. Whoever read it knows how many lines it dropped, and only the caller knows
 // which salts that chunk is about to be tested against.
 
-static void combs_buf_reject (hashcat_ctx_t *hashcat_ctx, const u32 salt_pos, const u64 pws_cnt, const u64 rejects)
+static void combs_buf_reject (hashcat_ctx_t *hashcat_ctx, const u32 salt_pos, const u64 pws_cnt, const u64 rejects, const bool fused)
 {
   if (rejects == 0) return;
 
@@ -5018,6 +5021,22 @@ static void combs_buf_reject (hashcat_ctx_t *hashcat_ctx, const u32 salt_pos, co
     for (u32 association_salt_pos = 0; association_salt_pos < pws_cnt; association_salt_pos++)
     {
       status_ctx->words_progress_rejected[association_salt_pos] += rejects;
+    }
+
+    return;
+  }
+
+  // a fused launch rejects the same amplifier items for every salt, and the salt-major
+  // iterations of the other salts are skipped, so the credit has to be spread here or every
+  // salt but the first keeps a zero rejected count for the whole run.
+
+  if (fused == true)
+  {
+    const hashes_t *hashes = hashcat_ctx->hashes;
+
+    for (u32 salt_pos_credit = 0; salt_pos_credit < hashes->salts_cnt; salt_pos_credit++)
+    {
+      status_ctx->words_progress_rejected[salt_pos_credit] += pws_cnt * rejects;
     }
 
     return;
@@ -5641,8 +5660,21 @@ static int run_cracker_salt_major (hashcat_ctx_t *hashcat_ctx, hc_device_param_t
     salts_cnt = 1;
   }
 
+  // A fused launch covers every salt, even after salt 0 is cracked.
+  // Keep this predicate equal to module_05500.c module_jit_build_options.
+
+  // Devices without a fused kernel must retain the ordinary salt loop.
+  const bool fuse_attack = ((user_options_extra->attack_kern == ATTACK_KERN_BF) || (user_options_extra->attack_kern == ATTACK_KERN_STRAIGHT)) && (user_options->attack_mode != ATTACK_MODE_ASSOCIATION);
+  const bool fuse_device = ((device_param->is_cuda == true) && (device_param->sm_major >= 5)) || (device_param->is_opencl == true) || (device_param->is_hip == true);
+  const bool fused = ((hashconfig->opts_type & OPTS_TYPE_MULTI_SALT_FUSED) != 0) && (fuse_attack == true) && (hashes->salts_cnt > 1) && (device_param->vector_width == 1) && (fuse_device == true);
+
   for (u32 salt_pos = 0; salt_pos < salts_cnt; salt_pos++)
   {
+    // Salt 0 launches the fused search. All session-specific inputs are
+    // read from salt_bufs by the kernel, so later salt iterations are redundant.
+
+    if ((fused == true) && (salt_pos != 0)) continue;
+
     wait_while_paused (status_ctx);
 
     salt_t *salt_buf = &hashes->salts_buf[salt_pos];
@@ -5749,7 +5781,7 @@ static int run_cracker_salt_major (hashcat_ctx_t *hashcat_ctx, hc_device_param_t
       }
       else
       {
-        if (hashes->salts_shown[salt_pos] == 1)
+        if ((fused == false) && (hashes->salts_shown[salt_pos] == 1))
         {
           status_ctx->words_progress_done[salt_pos] += progress_step (hashcat_ctx, device_param, pws_cnt, innerloop_left);
 
@@ -5764,7 +5796,7 @@ static int run_cracker_salt_major (hashcat_ctx_t *hashcat_ctx, hc_device_param_t
 
         if (amp_prepare (hashcat_ctx, device_param, innerloop_pos, &innerloop_left, transform, &amp_rejects) == -1) return -1;
 
-        combs_buf_reject (hashcat_ctx, salt_pos, pws_cnt, amp_rejects);
+        combs_buf_reject (hashcat_ctx, salt_pos, pws_cnt, amp_rejects, fused);
       }
 
       // Every amplifier item in the chunk was rejected, so there is nothing to launch. The amplifier
@@ -5793,9 +5825,12 @@ static int run_cracker_salt_major (hashcat_ctx_t *hashcat_ctx, hc_device_param_t
         {
           const u64 perf_sum_all = progress_step (hashcat_ctx, device_param, pws_cnt, innerloop_left);
 
-          // The base words this launch got through, which --progress-only answers in. A launch covers
-          // part of the inner loop for every base word in the chunk, so it is that fraction of the
-          // chunk, and the fractions of one full pass add up to the chunk itself.
+          // Count every candidate/session pair processed by a fused launch.
+          // Credit progress separately to each salt below.
+
+          const u64 perf_booked = (fused == true) ? (perf_sum_all * hashes->salts_cnt) : perf_sum_all;
+
+          // Record the base-word fraction covered by this amplifier chunk.
 
           device_param->outerloop_words += (double) pws_cnt * (double) innerloop_left / (double) innerloop_cnt;
 
@@ -5805,7 +5840,7 @@ static int run_cracker_salt_major (hashcat_ctx_t *hashcat_ctx, hc_device_param_t
 
           u32 speed_pos = device_param->speed_pos;
 
-          device_param->speed_cnt[speed_pos] = perf_sum_all;
+          device_param->speed_cnt[speed_pos] = perf_booked;
 
           device_param->speed_msec[speed_pos] = speed_msec;
 
@@ -5833,7 +5868,17 @@ static int run_cracker_salt_major (hashcat_ctx_t *hashcat_ctx, hc_device_param_t
           }
           else
           {
-            status_ctx->words_progress_done[salt_pos] += perf_sum_all;
+            if (fused == true)
+            {
+              for (u32 salt_pos_credit = 0; salt_pos_credit < hashes->salts_cnt; salt_pos_credit++)
+              {
+                status_ctx->words_progress_done[salt_pos_credit] += perf_sum_all;
+              }
+            }
+            else
+            {
+              status_ctx->words_progress_done[salt_pos] += perf_booked;
+            }
           }
 
           hc_thread_mutex_unlock (status_ctx->mux_counter);
@@ -6076,7 +6121,8 @@ static int run_cracker_amp_major (hashcat_ctx_t *hashcat_ctx, hc_device_param_t 
 
     for (u32 live_pos = 0; live_pos < live_cnt; live_pos++)
     {
-      combs_buf_reject (hashcat_ctx, live_salts[live_pos], pws_cnt, amp_rejects);
+      // The outside-kernel salt-inner loop never uses fusion.
+      combs_buf_reject (hashcat_ctx, live_salts[live_pos], pws_cnt, amp_rejects, 0);
     }
 
     // Every amplifier item in the chunk was rejected, so there is nothing to launch. The amplifier
@@ -14992,9 +15038,9 @@ int backend_session_begin (hashcat_ctx_t *hashcat_ctx)
     // we don't have sm_* on vendors not NV but it doesn't matter
 
     #if defined (DEBUG)
-    build_options_len += snprintf (build_options_buf + build_options_len, build_options_sz - build_options_len, "-D LOCAL_MEM_TYPE=%d -D VENDOR_ID=%u -D DEVICE_VENDOR_ID=%u -D CUDA_ARCH=%u -D HAS_ADD=%u -D HAS_ADDC=%u -D HAS_SUB=%u -D HAS_SUBC=%u -D HAS_VADD=%u -D HAS_VADDC=%u -D HAS_VADD_CO=%u -D HAS_VADDC_CO=%u -D HAS_VSUB=%u -D HAS_VSUBB=%u -D HAS_VSUB_CO=%u -D HAS_VSUBB_CO=%u -D HAS_VPERM=%u -D HAS_VADD3=%u -D HAS_VBFE=%u -D HAS_BFE=%u -D HAS_LOP3=%u -D HAS_MOV64=%u -D HAS_PRMT=%u -D HAS_SHFW=%u -D VECT_SIZE=%d -D DEVICE_TYPE=%u -D DGST_R0=%u -D DGST_R1=%u -D DGST_R2=%u -D DGST_R3=%u -D DGST_ELEM=%u -D KERN_TYPE=%u -D ATTACK_EXEC=%u -D ATTACK_KERN=%u -D ATTACK_MODE=%u -D COMBS_MIDDLE=%u ", device_param->device_local_mem_type, device_param->opencl_platform_vendor_id, device_param->opencl_device_vendor_id, (device_param->sm_major * 100) + (device_param->sm_minor * 10), device_param->has_add, device_param->has_addc, device_param->has_sub, device_param->has_subc, device_param->has_vadd, device_param->has_vaddc, device_param->has_vadd_co, device_param->has_vaddc_co, device_param->has_vsub, device_param->has_vsubb, device_param->has_vsub_co, device_param->has_vsubb_co, device_param->has_vperm, device_param->has_vadd3, device_param->has_vbfe, device_param->has_bfe, device_param->has_lop3, device_param->has_mov64, device_param->has_prmt, device_param->has_shfw, device_param->vector_width, (u32) device_param->opencl_device_type, hashconfig->dgst_pos0, hashconfig->dgst_pos1, hashconfig->dgst_pos2, hashconfig->dgst_pos3, hashconfig->dgst_size / 4, kern_type, hashconfig->attack_exec, user_options_extra->attack_kern, user_options->attack_mode, (hashcat_ctx->mask_ctx->needs_middle == true) ? 1 : 0);
+    build_options_len += snprintf (build_options_buf + build_options_len, build_options_sz - build_options_len, "-D LOCAL_MEM_TYPE=%d -D VENDOR_ID=%u -D DEVICE_VENDOR_ID=%u -D CUDA_ARCH=%u -D HAS_ADD=%u -D HAS_ADDC=%u -D HAS_SUB=%u -D HAS_SUBC=%u -D HAS_VADD=%u -D HAS_VADDC=%u -D HAS_VADD_CO=%u -D HAS_VADDC_CO=%u -D HAS_VSUB=%u -D HAS_VSUBB=%u -D HAS_VSUB_CO=%u -D HAS_VSUBB_CO=%u -D HAS_VPERM=%u -D HAS_VADD3=%u -D HAS_VBFE=%u -D HAS_BFE=%u -D HAS_LOP3=%u -D HAS_MOV64=%u -D HAS_PRMT=%u -D HAS_SHFW=%u -D VECT_SIZE=%d -D DEVICE_TYPE=%u -D DGST_R0=%u -D DGST_R1=%u -D DGST_R2=%u -D DGST_R3=%u -D DGST_ELEM=%u -D KERN_TYPE=%u -D ATTACK_EXEC=%u -D ATTACK_KERN=%u -D ATTACK_MODE=%u -D COMBS_MIDDLE=%u -D AMP_TAIL=%u ", device_param->device_local_mem_type, device_param->opencl_platform_vendor_id, device_param->opencl_device_vendor_id, (device_param->sm_major * 100) + (device_param->sm_minor * 10), device_param->has_add, device_param->has_addc, device_param->has_sub, device_param->has_subc, device_param->has_vadd, device_param->has_vaddc, device_param->has_vadd_co, device_param->has_vaddc_co, device_param->has_vsub, device_param->has_vsubb, device_param->has_vsub_co, device_param->has_vsubb_co, device_param->has_vperm, device_param->has_vadd3, device_param->has_vbfe, device_param->has_bfe, device_param->has_lop3, device_param->has_mov64, device_param->has_prmt, device_param->has_shfw, device_param->vector_width, (u32) device_param->opencl_device_type, hashconfig->dgst_pos0, hashconfig->dgst_pos1, hashconfig->dgst_pos2, hashconfig->dgst_pos3, hashconfig->dgst_size / 4, kern_type, hashconfig->attack_exec, user_options_extra->attack_kern, user_options->attack_mode, (hashcat_ctx->mask_ctx->needs_middle == true) ? 1 : 0, (hashcat_ctx->mask_ctx->amp_tail == true) ? 1 : 0);
     #else
-    build_options_len += snprintf (build_options_buf + build_options_len, build_options_sz - build_options_len, "-D LOCAL_MEM_TYPE=%d -D VENDOR_ID=%u -D DEVICE_VENDOR_ID=%u -D CUDA_ARCH=%u -D HAS_ADD=%u -D HAS_ADDC=%u -D HAS_SUB=%u -D HAS_SUBC=%u -D HAS_VADD=%u -D HAS_VADDC=%u -D HAS_VADD_CO=%u -D HAS_VADDC_CO=%u -D HAS_VSUB=%u -D HAS_VSUBB=%u -D HAS_VSUB_CO=%u -D HAS_VSUBB_CO=%u -D HAS_VPERM=%u -D HAS_VADD3=%u -D HAS_VBFE=%u -D HAS_BFE=%u -D HAS_LOP3=%u -D HAS_MOV64=%u -D HAS_PRMT=%u -D HAS_SHFW=%u -D VECT_SIZE=%d -D DEVICE_TYPE=%u -D DGST_R0=%u -D DGST_R1=%u -D DGST_R2=%u -D DGST_R3=%u -D DGST_ELEM=%u -D KERN_TYPE=%u -D ATTACK_EXEC=%u -D ATTACK_KERN=%u -D ATTACK_MODE=%u -D COMBS_MIDDLE=%u -w ", device_param->device_local_mem_type, device_param->opencl_platform_vendor_id, device_param->opencl_device_vendor_id, (device_param->sm_major * 100) + (device_param->sm_minor * 10), device_param->has_add, device_param->has_addc, device_param->has_sub, device_param->has_subc, device_param->has_vadd, device_param->has_vaddc, device_param->has_vadd_co, device_param->has_vaddc_co, device_param->has_vsub, device_param->has_vsubb, device_param->has_vsub_co, device_param->has_vsubb_co, device_param->has_vperm, device_param->has_vadd3, device_param->has_vbfe, device_param->has_bfe, device_param->has_lop3, device_param->has_mov64, device_param->has_prmt, device_param->has_shfw, device_param->vector_width, (u32) device_param->opencl_device_type, hashconfig->dgst_pos0, hashconfig->dgst_pos1, hashconfig->dgst_pos2, hashconfig->dgst_pos3, hashconfig->dgst_size / 4, kern_type, hashconfig->attack_exec, user_options_extra->attack_kern, user_options->attack_mode, (hashcat_ctx->mask_ctx->needs_middle == true) ? 1 : 0);
+    build_options_len += snprintf (build_options_buf + build_options_len, build_options_sz - build_options_len, "-D LOCAL_MEM_TYPE=%d -D VENDOR_ID=%u -D DEVICE_VENDOR_ID=%u -D CUDA_ARCH=%u -D HAS_ADD=%u -D HAS_ADDC=%u -D HAS_SUB=%u -D HAS_SUBC=%u -D HAS_VADD=%u -D HAS_VADDC=%u -D HAS_VADD_CO=%u -D HAS_VADDC_CO=%u -D HAS_VSUB=%u -D HAS_VSUBB=%u -D HAS_VSUB_CO=%u -D HAS_VSUBB_CO=%u -D HAS_VPERM=%u -D HAS_VADD3=%u -D HAS_VBFE=%u -D HAS_BFE=%u -D HAS_LOP3=%u -D HAS_MOV64=%u -D HAS_PRMT=%u -D HAS_SHFW=%u -D VECT_SIZE=%d -D DEVICE_TYPE=%u -D DGST_R0=%u -D DGST_R1=%u -D DGST_R2=%u -D DGST_R3=%u -D DGST_ELEM=%u -D KERN_TYPE=%u -D ATTACK_EXEC=%u -D ATTACK_KERN=%u -D ATTACK_MODE=%u -D COMBS_MIDDLE=%u -D AMP_TAIL=%u -w ", device_param->device_local_mem_type, device_param->opencl_platform_vendor_id, device_param->opencl_device_vendor_id, (device_param->sm_major * 100) + (device_param->sm_minor * 10), device_param->has_add, device_param->has_addc, device_param->has_sub, device_param->has_subc, device_param->has_vadd, device_param->has_vaddc, device_param->has_vadd_co, device_param->has_vaddc_co, device_param->has_vsub, device_param->has_vsubb, device_param->has_vsub_co, device_param->has_vsubb_co, device_param->has_vperm, device_param->has_vadd3, device_param->has_vbfe, device_param->has_bfe, device_param->has_lop3, device_param->has_mov64, device_param->has_prmt, device_param->has_shfw, device_param->vector_width, (u32) device_param->opencl_device_type, hashconfig->dgst_pos0, hashconfig->dgst_pos1, hashconfig->dgst_pos2, hashconfig->dgst_pos3, hashconfig->dgst_size / 4, kern_type, hashconfig->attack_exec, user_options_extra->attack_kern, user_options->attack_mode, (hashcat_ctx->mask_ctx->needs_middle == true) ? 1 : 0, (hashcat_ctx->mask_ctx->amp_tail == true) ? 1 : 0);
     #endif
 
     build_options_buf[build_options_len] = 0;
@@ -15273,6 +15319,14 @@ int backend_session_begin (hashcat_ctx_t *hashcat_ctx)
       // runs can build different source out of the same file as well
 
       if (hashcat_ctx->mask_ctx->needs_middle == true) extra_value += 1;
+
+      // and the amplifier word moves to the mask's tail for a queue whose masks open with too little,
+      // which is the other answer that reaches a kernel through -D alone. The two are separate bits:
+      // extra_value starts at ATTACK_MODE_NONE (100), never at the mode itself, and only 9 and 12
+      // replace it, so bit 0 is free above every one of those and bit 3 is free below the PCFG
+      // block, which starts at bit 8.
+
+      if (hashcat_ctx->mask_ctx->amp_tail == true) extra_value += 8;
 
       // and the device engine compiles its candidate array to a width the ruleset chose, so two rulesets
       // build different source out of the same file too. The general build options are not in the key,
@@ -15723,6 +15777,7 @@ int backend_session_begin (hashcat_ctx_t *hashcat_ctx)
     device_param->kernel_param.pcfg_pool_at2       = (device_param->pcfg_pool_parts > 2) ? (u32) (pool_at * 2) : 0xffffffff;
     device_param->kernel_param.pcfg_pool_at3       = (device_param->pcfg_pool_parts > 3) ? (u32) (pool_at * 3) : 0xffffffff;
     device_param->kernel_param.salt_pos_host       = 0;
+    device_param->kernel_param.salts_cnt           = hashes->salts_cnt;
     device_param->kernel_param.loop_pos            = 0;
     device_param->kernel_param.loop_cnt            = 0;
     device_param->kernel_param.il_cnt              = 0;
@@ -15809,6 +15864,7 @@ int backend_session_begin (hashcat_ctx_t *hashcat_ctx)
       device_param->kernel_params_mp_l_buf32[6] = 0;
       device_param->kernel_params_mp_l_buf32[7] = 0;
       device_param->kernel_params_mp_l_buf32[8] = 0;
+      device_param->kernel_params_mp_l_buf32[10] = 0;
       device_param->kernel_params_mp_l_buf64[9] = 0;
 
       device_param->kernel_params_mp_l[0] = NULL; // (hashconfig->attack_exec == ATTACK_EXEC_INSIDE_KERNEL)
@@ -15825,6 +15881,7 @@ int backend_session_begin (hashcat_ctx_t *hashcat_ctx)
       device_param->kernel_params_mp_l[7] = &device_param->kernel_params_mp_l_buf32[7];
       device_param->kernel_params_mp_l[8] = &device_param->kernel_params_mp_l_buf32[8];
       device_param->kernel_params_mp_l[9] = &device_param->kernel_params_mp_l_buf64[9];
+      device_param->kernel_params_mp_l[10] = &device_param->kernel_params_mp_l_buf32[10];
 
       device_param->kernel_params_mp_r_buf64[3] = 0;
       device_param->kernel_params_mp_r_buf32[4] = 0;
@@ -17678,12 +17735,38 @@ int backend_session_update_mp_rl (hashcat_ctx_t *hashcat_ctx, const u32 css_cnt_
     if (device_param->skipped == true) continue;
     if (device_param->skipped_warning == true) continue;
 
+    // The amplifier word lands at byte mask_ctx->amp_dst of the password, and the mask kernel writes
+    // the characters in front of it at the offsets it always wrote them at. With no tail (amp_dst
+    // zero, which is every run but a mask whose opening characters enumerate too little) that is the
+    // upstream layout: the word is the password's first four bytes and the mask starts at the split.
+    //
+    // The two halves cover css_cnt_r and css_cnt_l character positions either way, because the word is
+    // four bytes and only its placement moves. The terminator byte and the two length fields that go
+    // with it sit at the end of the mask, which is the base word's own end only when the word is at
+    // the front, so the position travels in a slot of its own rather than being the sum of the two
+    // lengths the base word kernel already has.
+
     device_param->kernel_params_mp_l_buf64[3] = 0;
     device_param->kernel_params_mp_l_buf32[4] = css_cnt_l;
-    device_param->kernel_params_mp_l_buf32[5] = css_cnt_r;
+    device_param->kernel_params_mp_l_buf32[5] = (mask_ctx->amp_dst != 0) ? 0 : css_cnt_r;
+    device_param->kernel_params_mp_l_buf32[10] = css_cnt_l + css_cnt_r;
 
     device_param->kernel_params_mp_r_buf64[3] = 0;
     device_param->kernel_params_mp_r_buf32[4] = css_cnt_r;
+
+    // The amplifier word kernel reads its mask80 argument as the character position its word starts
+    // at: the argument is zero for every -a 3 amplifier word, since the word is four bytes and none
+    // of them is a terminator. The output routine reads the same slot as the offset the word's
+    // characters are written at, which is the same number.
+
+    device_param->kernel_params_mp_r_buf32[5] = (mask_ctx->amp_dst != 0) ? mask_ctx->amp_dst : 0;
+
+    // The generic amplifier kernel writes the word straight into the password buffer, so it reads the
+    // offset from its own argument. combs_mode is zero for -a 3 because -a 3 has no base word.
+
+    device_param->kernel_params_amp_buf32[5] = mask_ctx->amp_dst;
+
+    device_param->kernel_param.amp_dst = mask_ctx->amp_dst;
 
     // mask_ctx->css_cnt rather than css_cnt_l + css_cnt_r. The two differ: the split is taken over the
     // mask length from before mp_css_append_salt () extended it, so the sum can be short of the table

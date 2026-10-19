@@ -1546,7 +1546,7 @@ static bool mask_ctx_lookup_whole (const mask_ctx_t *mask_ctx, const u8 *pw_buf,
 // adds fixed positions to it, and those are not the user's to spell. They cost nothing to leave out:
 // a fixed position has radix 1, so it contributes no digit and multiplies the offset by nothing.
 
-static void mask_ctx_lookup (hashcat_ctx_t *hashcat_ctx, const u32 css_cnt_orig, const u32 css_cnt_r)
+static void mask_ctx_lookup (hashcat_ctx_t *hashcat_ctx, const u32 css_cnt_orig, const u32 amp_start, const u32 amp_stop, const u32 word_start, const u32 word_stop)
 {
   const hashconfig_t   *hashconfig   = hashcat_ctx->hashconfig;
   const user_options_t *user_options = hashcat_ctx->user_options;
@@ -1669,8 +1669,8 @@ static void mask_ctx_lookup (hashcat_ctx_t *hashcat_ctx, const u32 css_cnt_orig,
 
   u32 fail_pos = 0;
 
-  const bool got = sp_rank (mask_ctx->root_css_buf, mask_ctx->markov_css_buf, pw_buf, 0, css_cnt_r, &amp, &fail_pos)
-                && sp_rank (mask_ctx->root_css_buf, mask_ctx->markov_css_buf, pw_buf, css_cnt_r, css_cnt_orig, &word, &fail_pos);
+  const bool got = sp_rank (mask_ctx->root_css_buf, mask_ctx->markov_css_buf, pw_buf, amp_start, amp_stop, &amp, &fail_pos)
+                && sp_rank (mask_ctx->root_css_buf, mask_ctx->markov_css_buf, pw_buf, word_start, word_stop, &word, &fail_pos);
 
   if (got == false)
   {
@@ -1682,7 +1682,7 @@ static void mask_ctx_lookup (hashcat_ctx_t *hashcat_ctx, const u32 css_cnt_orig,
     // Sticky across the queue, because the claim it backs is about the queue: some mask in it is one
     // -S would reach. A plain assignment would leave the last round's answer rather than the queue's.
 
-    if (css_cnt_r > 0)
+    if (amp_stop > amp_start)
     {
       lookup->other_probed = true;
 
@@ -1712,7 +1712,7 @@ static void mask_ctx_lookup (hashcat_ctx_t *hashcat_ctx, const u32 css_cnt_orig,
   // --markov-threshold root holds characters the markov table at that position does not. Handing out
   // an offset without saying that would send a user who later adds -S past their own password.
 
-  if (css_cnt_r > 0)
+  if (amp_stop > amp_start)
   {
     lookup->other_probed = true;
     lookup->other        = mask_ctx_lookup_whole (mask_ctx, pw_buf, css_cnt_orig);
@@ -2591,7 +2591,28 @@ int mask_ctx_update_loop (hashcat_ctx_t *hashcat_ctx)
 
       mp_css_split_cnt (hashcat_ctx, css_cnt_orig, css_cnt_lr);
 
-      if (sp_get_sum (0, css_cnt_lr[1], mask_ctx->root_css_buf, &mask_ctx->bfs_cnt) == -1)
+      // A literal-heavy head can leave too little amplifier work. Move the
+      // amplifier to the tail only when its keyspace is larger and the head
+      // keyspace is below 26. Character tables and candidate coverage stay the same.
+      // The queue-wide amp_tail flag ensures the placement code was compiled.
+
+      mask_ctx->amp_dst = 0;
+
+      if ((mask_ctx->amp_tail == true) && ((hashconfig->opts_type & OPTS_TYPE_AMP_TAIL) != 0) && (mask_ctx->css_cnt == css_cnt_orig))
+      {
+        u64 amp_head = 0;
+        u64 amp_tail = 0;
+
+        if (sp_get_sum (0, css_cnt_lr[1], mask_ctx->root_css_buf, &amp_head) == -1) return -1;
+
+        if (sp_get_sum (mask_ctx->css_cnt - css_cnt_lr[1], mask_ctx->css_cnt, mask_ctx->root_css_buf, &amp_tail) == -1) return -1;
+
+        if ((amp_head < 26) && (amp_tail > amp_head)) mask_ctx->amp_dst = mask_ctx->css_cnt - css_cnt_lr[1];
+      }
+
+      const u32 amp_start = (mask_ctx->amp_dst != 0) ? mask_ctx->amp_dst : 0;
+
+      if (sp_get_sum (amp_start, amp_start + css_cnt_lr[1], mask_ctx->root_css_buf, &mask_ctx->bfs_cnt) == -1)
       {
         event_log_error (hashcat_ctx, "Integer overflow detected in keyspace of mask: %s", mask_ctx->mask);
 
@@ -2601,8 +2622,17 @@ int mask_ctx_update_loop (hashcat_ctx_t *hashcat_ctx)
       // Everything a lookup needs is here and nowhere else: the tables the run will enumerate, the
       // cut it will enumerate them in two halves at, and the mask's own length before an appended
       // salt was added to it. The next round overwrites all three.
+      //
+      // The amplifier is the half that the host enumerates, so which stretch of the mask it covers
+      // depends on where the word lands: the mask's tail under OPTS_TYPE_AMP_TAIL, its head otherwise.
+      // The base word is the other half, and the two are adjacent stretches either way.
 
-      mask_ctx_lookup (hashcat_ctx, css_cnt_orig, css_cnt_lr[1]);
+      const u32 amp_stop = amp_start + css_cnt_lr[1];
+
+      const u32 word_start = (amp_start == 0) ? amp_stop : 0;
+      const u32 word_stop  = (amp_start == 0) ? css_cnt_orig : amp_start;
+
+      mask_ctx_lookup (hashcat_ctx, css_cnt_orig, amp_start, amp_stop, word_start, word_stop);
 
       if (backend_session_update_mp_rl (hashcat_ctx, css_cnt_lr[0], css_cnt_lr[1]) == -1) return -1;
     }
@@ -3221,6 +3251,111 @@ void mask_ctx_lookup_report (hashcat_ctx_t *hashcat_ctx)
   }
 }
 
+// Read a charset size from either end, including UTF-16 expansion bytes.
+
+static u32 mp_css_scan_len (const cs_t *css_scan, const u32 css_cnt, const bool utf16, const bool utf16_be, const u32 entry, const bool from_tail)
+{
+  if (utf16 == false) return css_scan[from_tail ? (css_cnt - 1 - entry) : entry].cs_len;
+
+  // The last k entries of a 2 * css_cnt entry table end on its last entry regardless of k, so the
+  // parity of an entry is the parity the head walk would give it only in the head direction.
+
+  const u32  pos    = from_tail ? (css_cnt - 1 - (entry / 2)) : (entry / 2);
+  const bool second = from_tail ? ((entry % 2) == 0) : ((entry % 2) == 1);
+
+  if (utf16_be == true) return (second == true) ? css_scan[pos].cs_len : 1;
+  else                  return (second == true) ? 1 : css_scan[pos].cs_len;
+}
+
+// Scan all queued masks before JIT compilation. Enable AMP_TAIL if any
+// mask needs tail placement. Each mask still selects its own amp_dst.
+
+static void mask_ctx_amp_tail_scan (hashcat_ctx_t *hashcat_ctx)
+{
+  const hashconfig_t         *hashconfig         = hashcat_ctx->hashconfig;
+  const user_options_t       *user_options       = hashcat_ctx->user_options;
+  const user_options_extra_t *user_options_extra = hashcat_ctx->user_options_extra;
+  mask_ctx_t                 *mask_ctx           = hashcat_ctx->mask_ctx;
+
+  mask_ctx->amp_tail = false;
+
+  // Host-side candidate generators do not use the mask amplifier split.
+
+  if ((hashconfig->opts_type & OPTS_TYPE_AMP_TAIL) == 0) return;
+
+  if (user_options_extra->attack_kern != ATTACK_KERN_BF) return;
+
+  if (user_options->slow_candidates == true) return;
+
+  const bool utf16    = (hashconfig->opts_type & (OPTS_TYPE_PT_UTF16LE | OPTS_TYPE_PT_UTF16BE)) != 0;
+  const bool utf16_be = (hashconfig->opts_type & OPTS_TYPE_PT_UTF16BE) != 0;
+
+  cs_t *css_scan = (cs_t *) hccalloc (256, sizeof (cs_t));
+
+  for (u32 mask_pos = 0; mask_pos < mask_ctx->masks_cnt; mask_pos++)
+  {
+    mask_ctx->mask = mask_ctx->masks[mask_pos];
+
+    // Resolve per-mask charsets using the same parser as the attack loop.
+
+    if (mask_ctx_parse_maskfile (hashcat_ctx) == -1) break;
+
+    u32 css_cnt = 0;
+
+    if (mp_gen_css (hashcat_ctx, mask_ctx->mask, strlen (mask_ctx->mask), mask_ctx->mp_sys, mask_ctx->mp_usr, css_scan, &css_cnt) == -1) break;
+
+    if (css_cnt == 0) continue;
+
+    // The count the split is handed, which is the queue's own up to the expansion: an appended salt
+    // would extend it, but a mask the salt was appended to keeps the upstream layout, so leaving the
+    // salt out of the count widens the question rather than answering it differently.
+
+    const u32 css_cnt_orig = (utf16 == true) ? (css_cnt * 2) : css_cnt;
+
+    // The scratch tables are what the split reads when it has to weigh the first three positions, and
+    // css_cnt has to be the count they hold, so both are stood in for and put back afterwards.
+
+    cs_t *css_buf_save = mask_ctx->css_buf;
+    u32   css_cnt_save = mask_ctx->css_cnt;
+
+    mask_ctx->css_buf = css_scan;
+    mask_ctx->css_cnt = css_cnt_orig;
+
+    u32 css_cnt_lr[2] = { 0, 0 };
+
+    mp_css_split_cnt (hashcat_ctx, css_cnt_orig, css_cnt_lr);
+
+    mask_ctx->css_buf = css_buf_save;
+    mask_ctx->css_cnt = css_cnt_save;
+
+    const u32 css_r = css_cnt_lr[1];
+
+    if ((css_r == 0) || (css_r > css_cnt_orig)) continue;
+
+    u64 amp_head = 1;
+    u64 amp_tail = 1;
+
+    for (u32 i = 0; i < css_r; i++)
+    {
+      amp_head *= (u64) mp_css_scan_len (css_scan, css_cnt, utf16, utf16_be, i, false);
+      amp_tail *= (u64) mp_css_scan_len (css_scan, css_cnt, utf16, utf16_be, i, true);
+    }
+
+    if ((amp_head < 26) && (amp_tail > amp_head))
+    {
+      mask_ctx->amp_tail = true;
+
+      break;
+    }
+  }
+
+  hcfree (css_scan);
+
+  // The scan walked the queue, so the round that follows starts it where the queue starts.
+
+  mask_ctx->mask = mask_ctx->masks[0];
+}
+
 int mask_ctx_init (hashcat_ctx_t *hashcat_ctx)
 {
   const hashconfig_t         *hashconfig         = hashcat_ctx->hashconfig;
@@ -3511,6 +3646,11 @@ int mask_ctx_init (hashcat_ctx_t *hashcat_ctx)
       break;
     }
   }
+
+  // Does the queue want the amplifier word placed at a mask's tail anywhere in it? Also settled before
+  // the kernels are built, and for the same reason: the answer decides what they compile.
+
+  mask_ctx_amp_tail_scan (hashcat_ctx);
 
   // The last work argument is the wordlist a ?q names, so there has to be a ?q somewhere to name it.
   // Every mask is in memory by now, so this reads them rather than the file they may have come from.

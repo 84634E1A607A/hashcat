@@ -154,7 +154,9 @@ using namespace metal;
 #define LOCAL_MEM_TYPE_LOCAL  1
 #define LOCAL_MEM_TYPE_GLOBAL 2
 
-#if LOCAL_MEM_TYPE == LOCAL_MEM_TYPE_LOCAL
+// Fused salt staging needs __local storage even when a CPU OpenCL runtime
+// implements local memory in global RAM.
+#if (LOCAL_MEM_TYPE == LOCAL_MEM_TYPE_LOCAL) || defined(NN_FUSE_SALTS)
 #define REAL_SHM
 #endif
 

@@ -12,14 +12,17 @@
 
 #define CHARSIZ 256
 
-DECLSPEC void generate_pw (PRIVATE_AS u32 *pw_buf, GLOBAL_AS const cs_t *root_css_buf, GLOBAL_AS const cs_t *markov_css_buf, const u32 pw_l_len, const u32 pw_r_len, const u32 mask80, const u32 bits14, const u32 bits15, u64 val)
+// Tail placement moves the amplifier word without moving the charset
+// tables. Base characters retain their original password byte offsets.
+
+DECLSPEC void generate_pw (PRIVATE_AS u32 *pw_buf, GLOBAL_AS const cs_t *root_css_buf, GLOBAL_AS const cs_t *markov_css_buf, const u32 pw_l_len, const u32 pw_css, const u32 pw_dst, const u32 pw_term, const u32 mask80, const u32 bits14, const u32 bits15, u64 val)
 {
-  GLOBAL_AS const cs_t *cs = &root_css_buf[pw_r_len];
+  GLOBAL_AS const cs_t *cs = &root_css_buf[pw_css];
 
   u32 i;
   u32 j;
 
-  for (i = 0, j = pw_r_len; i < pw_l_len; i++, j++)
+  for (i = 0, j = pw_dst; i < pw_l_len; i++, j++)
   {
     const u32 len = cs->cs_len;
 
@@ -35,16 +38,16 @@ DECLSPEC void generate_pw (PRIVATE_AS u32 *pw_buf, GLOBAL_AS const cs_t *root_cs
 
     pw_buf[jd4] |= key << (jm4 * 8);
 
-    cs = &markov_css_buf[(j * CHARSIZ) + key];
+    cs = &markov_css_buf[((pw_css + i) * CHARSIZ) + key];
   }
 
-  const u32 jd4 = j / 4;
-  const u32 jm4 = j % 4;
+  const u32 jd4 = pw_term / 4;
+  const u32 jm4 = pw_term % 4;
 
   pw_buf[jd4] |= (0xffu << (jm4 * 8)) & mask80;
 
-  if (bits14) pw_buf[14] = (pw_l_len + pw_r_len) * 8;
-  if (bits15) pw_buf[15] = (pw_l_len + pw_r_len) * 8;
+  if (bits14) pw_buf[14] = pw_term * 8;
+  if (bits15) pw_buf[15] = pw_term * 8;
 }
 
 KERNEL_FQ KERNEL_FA void l_markov (KERN_ATTR_L_MARKOV)
@@ -120,9 +123,13 @@ KERNEL_FQ KERNEL_FA void l_markov (KERN_ATTR_L_MARKOV)
   pw.i[62] = 0;
   pw.i[63] = 0;
 
-  pw.pw_len = pw_l_len + pw_r_len;
+  // The terminator's position is the mask's byte length and the candidate is that long: the two
+  // lengths the kernel was handed differ from it only when the amplifier word is at the mask's tail,
+  // and then the characters in front of the word are shorter than the password by the word.
 
-  generate_pw (pw.i, root_css_buf, markov_css_buf, pw_l_len, pw_r_len, mask80, bits14, bits15, off + gid);
+  pw.pw_len = pw_l_term;
+
+  generate_pw (pw.i, root_css_buf, markov_css_buf, pw_l_len, pw_r_len, pw_r_len, pw_l_term, mask80, bits14, bits15, off + gid);
 
   pws_buf_l[gid] = pw;
 }
@@ -200,7 +207,7 @@ KERNEL_FQ KERNEL_FA void r_markov (KERN_ATTR_R_MARKOV)
   pw.i[62] = 0;
   pw.i[63] = 0;
 
-  generate_pw (pw.i, root_css_buf, markov_css_buf, pw_r_len, 0, 0, 0, 0, off + gid);
+  generate_pw (pw.i, root_css_buf, markov_css_buf, pw_r_len, pw_r_css, 0, 0, 0, 0, 0, off + gid);
 
   pws_buf_r[gid].i = pw.i[0];
 }
@@ -280,7 +287,7 @@ KERNEL_FQ KERNEL_FA void C_markov (KERN_ATTR_C_MARKOV)
 
   pw.pw_len = pw_len;
 
-  generate_pw (pw.i, root_css_buf, markov_css_buf, pw_len, 0, mask80, bits14, bits15, off + gid);
+  generate_pw (pw.i, root_css_buf, markov_css_buf, pw_len, 0, 0, pw_len, mask80, bits14, bits15, off + gid);
 
   pws_buf[gid] = pw;
 }

@@ -2103,6 +2103,14 @@ typedef struct kernel_param
   u32 pcfg_pool_at2;        // 41
   u32 pcfg_pool_at3;        // 42
 
+  // Byte offset of the current mask's amplifier word. Zero means head placement.
+
+  u32 amp_dst;              // 43
+
+  // Number of salt records bound to this launch, including the one-record self-test.
+
+  u32 salts_cnt;            // 44
+
 } kernel_param_t;
 
 typedef struct salt

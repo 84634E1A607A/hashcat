@@ -1158,6 +1158,232 @@ DECLSPEC void _des_crypt_encrypt_lm_vect (PRIVATE_AS u32x *iv, PRIVATE_AS const 
   iv[1] = r;
 }
 
+// Keep the mutable key halves and generate each round's subkey on demand.
+// The init and step operations match _des_crypt_keysetup_lm_vect, avoiding
+// two live 16-word schedule arrays in the fused verifier.
+
+DECLSPEC void _des_crypt_keysetup_lm_vect_ks_init (u32x c, u32x d, PRIVATE_AS u32x *ks)
+{
+  PERM_OP  (d, c, 4, 0x0f0f0f0f);
+  HPERM_OP (c,    2, 0xcccc0000);
+  HPERM_OP (d,    2, 0xcccc0000);
+  PERM_OP  (d, c, 1, 0x55555555);
+  PERM_OP  (c, d, 8, 0x00ff00ff);
+  PERM_OP  (d, c, 1, 0x55555555);
+
+  d = ((d & 0x000000ff) << 16)
+    | ((d & 0x0000ff00) <<  0)
+    | ((d & 0x00ff0000) >> 16)
+    | ((c & 0xf0000000) >>  4);
+
+  c = c & 0x0fffffff;
+
+  ks[0] = c;
+  ks[1] = d;
+}
+
+// PoCL 6 can return zero subkeys from an out-of-line step with local tables.
+// Keep its private outputs in the caller on CPU OpenCL.
+#if defined(IS_OPENCL) && defined(IS_CPU)
+__attribute__((always_inline))
+#endif
+DECLSPEC void _des_crypt_keysetup_lm_vect_ks_step (PRIVATE_AS u32x *ks, const u32 i, PRIVATE_AS u32x *Kc, PRIVATE_AS u32x *Kd, SHM_TYPE u32 (*s_skb)[64])
+{
+  u32x c = ks[0];
+  u32x d = ks[1];
+
+  if ((i < 2) || (i == 8) || (i == 15))
+  {
+    c = ((c >> 1) | (c << 27));
+    d = ((d >> 1) | (d << 27));
+  }
+  else
+  {
+    c = ((c >> 2) | (c << 26));
+    d = ((d >> 2) | (d << 26));
+  }
+
+  c = c & 0x0fffffff;
+  d = d & 0x0fffffff;
+
+  const u32x c00 = (c >>  0) & 0x0000003f;
+  const u32x c06 = (c >>  6) & 0x00383003;
+  const u32x c07 = (c >>  7) & 0x0000003c;
+  const u32x c13 = (c >> 13) & 0x0000060f;
+  const u32x c20 = (c >> 20) & 0x00000001;
+
+  u32x s = DES_BOX (((c00 >>  0) & 0xff), 0, s_skb)
+         | DES_BOX (((c06 >>  0) & 0xff)
+                   |((c07 >>  0) & 0xff), 1, s_skb)
+         | DES_BOX (((c13 >>  0) & 0xff)
+                   |((c06 >>  8) & 0xff), 2, s_skb)
+         | DES_BOX (((c20 >>  0) & 0xff)
+                   |((c13 >>  8) & 0xff)
+                   |((c06 >> 16) & 0xff), 3, s_skb);
+
+  const u32x d00 = (d >>  0) & 0x00003c3f;
+  const u32x d07 = (d >>  7) & 0x00003f03;
+  const u32x d21 = (d >> 21) & 0x0000000f;
+  const u32x d22 = (d >> 22) & 0x00000030;
+
+  u32x t = DES_BOX (((d00 >>  0) & 0xff), 4, s_skb)
+         | DES_BOX (((d07 >>  0) & 0xff)
+                   |((d00 >>  8) & 0xff), 5, s_skb)
+         | DES_BOX (((d07 >>  8) & 0xff), 6, s_skb)
+         | DES_BOX (((d21 >>  0) & 0xff)
+                   |((d22 >>  0) & 0xff), 7, s_skb);
+
+  *Kc = ((t << 16) | (s & 0x0000ffff));
+  *Kd = ((s >> 16) | (t & 0xffff0000));
+
+  ks[0] = c;
+  ks[1] = d;
+}
+
+// The three entry points below are _des_crypt_encrypt_lm_vect, its fifteen-round split and its
+// closing round, each with a round's Kc/Kd produced by the step above instead of read from an
+// array.  Their round bodies are the ones above.
+
+DECLSPEC void _des_crypt_encrypt_lm_vect_ks (PRIVATE_AS u32x *iv, PRIVATE_AS const u32x *data, PRIVATE_AS u32x *ks, SHM_TYPE u32 (*s_skb)[64], SHM_TYPE u32 (*s_SPtrans)[64])
+{
+  u32x r = data[0];
+  u32x l = data[1];
+
+  #ifdef _unroll
+  #pragma unroll
+  #endif
+  for (u32 i = 0; i < 16; i += 2)
+  {
+    u32x Kc;
+    u32x Kd;
+    u32x u;
+    u32x t;
+
+    _des_crypt_keysetup_lm_vect_ks_step (ks, i + 0, &Kc, &Kd, s_skb);
+
+    u = Kc ^ hc_rotl32 (r, 30u);
+    t = Kd ^ hc_rotl32 (r, 26u);
+
+    l ^= DES_BOX (((u >>  0) & 0x3f), 0, s_SPtrans)
+       | DES_BOX (((u >>  8) & 0x3f), 2, s_SPtrans)
+       | DES_BOX (((u >> 16) & 0x3f), 4, s_SPtrans)
+       | DES_BOX (((u >> 24) & 0x3f), 6, s_SPtrans)
+       | DES_BOX (((t >>  0) & 0x3f), 1, s_SPtrans)
+       | DES_BOX (((t >>  8) & 0x3f), 3, s_SPtrans)
+       | DES_BOX (((t >> 16) & 0x3f), 5, s_SPtrans)
+       | DES_BOX (((t >> 24) & 0x3f), 7, s_SPtrans);
+
+    _des_crypt_keysetup_lm_vect_ks_step (ks, i + 1, &Kc, &Kd, s_skb);
+
+    u = Kc ^ hc_rotl32 (l, 30u);
+    t = Kd ^ hc_rotl32 (l, 26u);
+
+    r ^= DES_BOX (((u >>  0) & 0x3f), 0, s_SPtrans)
+       | DES_BOX (((u >>  8) & 0x3f), 2, s_SPtrans)
+       | DES_BOX (((u >> 16) & 0x3f), 4, s_SPtrans)
+       | DES_BOX (((u >> 24) & 0x3f), 6, s_SPtrans)
+       | DES_BOX (((t >>  0) & 0x3f), 1, s_SPtrans)
+       | DES_BOX (((t >>  8) & 0x3f), 3, s_SPtrans)
+       | DES_BOX (((t >> 16) & 0x3f), 5, s_SPtrans)
+       | DES_BOX (((t >> 24) & 0x3f), 7, s_SPtrans);
+  }
+
+  iv[0] = l;
+  iv[1] = r;
+}
+
+DECLSPEC void _des_crypt_encrypt_lm_vect_ks_split (PRIVATE_AS u32x *iv, PRIVATE_AS const u32x *data, PRIVATE_AS u32x *ks, SHM_TYPE u32 (*s_skb)[64], SHM_TYPE u32 (*s_SPtrans)[64])
+{
+  u32x r = data[0];
+  u32x l = data[1];
+
+  #ifdef _unroll
+  #pragma unroll
+  #endif
+  for (u32 i = 0; i < 14; i += 2)
+  {
+    u32x Kc;
+    u32x Kd;
+    u32x u;
+    u32x t;
+
+    _des_crypt_keysetup_lm_vect_ks_step (ks, i + 0, &Kc, &Kd, s_skb);
+
+    u = Kc ^ hc_rotl32 (r, 30u);
+    t = Kd ^ hc_rotl32 (r, 26u);
+
+    l ^= DES_BOX (((u >>  0) & 0x3f), 0, s_SPtrans)
+       | DES_BOX (((u >>  8) & 0x3f), 2, s_SPtrans)
+       | DES_BOX (((u >> 16) & 0x3f), 4, s_SPtrans)
+       | DES_BOX (((u >> 24) & 0x3f), 6, s_SPtrans)
+       | DES_BOX (((t >>  0) & 0x3f), 1, s_SPtrans)
+       | DES_BOX (((t >>  8) & 0x3f), 3, s_SPtrans)
+       | DES_BOX (((t >> 16) & 0x3f), 5, s_SPtrans)
+       | DES_BOX (((t >> 24) & 0x3f), 7, s_SPtrans);
+
+    _des_crypt_keysetup_lm_vect_ks_step (ks, i + 1, &Kc, &Kd, s_skb);
+
+    u = Kc ^ hc_rotl32 (l, 30u);
+    t = Kd ^ hc_rotl32 (l, 26u);
+
+    r ^= DES_BOX (((u >>  0) & 0x3f), 0, s_SPtrans)
+       | DES_BOX (((u >>  8) & 0x3f), 2, s_SPtrans)
+       | DES_BOX (((u >> 16) & 0x3f), 4, s_SPtrans)
+       | DES_BOX (((u >> 24) & 0x3f), 6, s_SPtrans)
+       | DES_BOX (((t >>  0) & 0x3f), 1, s_SPtrans)
+       | DES_BOX (((t >>  8) & 0x3f), 3, s_SPtrans)
+       | DES_BOX (((t >> 16) & 0x3f), 5, s_SPtrans)
+       | DES_BOX (((t >> 24) & 0x3f), 7, s_SPtrans);
+  }
+
+  // the split's last round, the odd half, which writes l and not r
+
+  u32x Kc;
+  u32x Kd;
+
+  _des_crypt_keysetup_lm_vect_ks_step (ks, 14, &Kc, &Kd, s_skb);
+
+  u32x u = Kc ^ hc_rotl32 (r, 30u);
+  u32x t = Kd ^ hc_rotl32 (r, 26u);
+
+  l ^= DES_BOX (((u >>  0) & 0x3f), 0, s_SPtrans)
+     | DES_BOX (((u >>  8) & 0x3f), 2, s_SPtrans)
+     | DES_BOX (((u >> 16) & 0x3f), 4, s_SPtrans)
+     | DES_BOX (((u >> 24) & 0x3f), 6, s_SPtrans)
+     | DES_BOX (((t >>  0) & 0x3f), 1, s_SPtrans)
+     | DES_BOX (((t >>  8) & 0x3f), 3, s_SPtrans)
+     | DES_BOX (((t >> 16) & 0x3f), 5, s_SPtrans)
+     | DES_BOX (((t >> 24) & 0x3f), 7, s_SPtrans);
+
+  iv[0] = l;
+  iv[1] = r;
+}
+
+DECLSPEC void _des_crypt_encrypt_lm_vect_ks_finish (PRIVATE_AS u32x *iv, PRIVATE_AS u32x *ks, SHM_TYPE u32 (*s_skb)[64], SHM_TYPE u32 (*s_SPtrans)[64])
+{
+  const u32x r = iv[1];
+  const u32x l = iv[0];
+
+  u32x Kc;
+  u32x Kd;
+
+  _des_crypt_keysetup_lm_vect_ks_step (ks, 15, &Kc, &Kd, s_skb);
+
+  // round 16: the even half, which writes r and leaves l as the ks split returned it
+
+  u32x u = Kc ^ hc_rotl32 (l, 30u);
+  u32x t = Kd ^ hc_rotl32 (l, 26u);
+
+  iv[1] = r ^ (DES_BOX (((u >>  0) & 0x3f), 0, s_SPtrans)
+             | DES_BOX (((u >>  8) & 0x3f), 2, s_SPtrans)
+             | DES_BOX (((u >> 16) & 0x3f), 4, s_SPtrans)
+             | DES_BOX (((u >> 24) & 0x3f), 6, s_SPtrans)
+             | DES_BOX (((t >>  0) & 0x3f), 1, s_SPtrans)
+             | DES_BOX (((t >>  8) & 0x3f), 3, s_SPtrans)
+             | DES_BOX (((t >> 16) & 0x3f), 5, s_SPtrans)
+             | DES_BOX (((t >> 24) & 0x3f), 7, s_SPtrans));
+}
+
 DECLSPEC void _des_crypt_encrypt_racf (PRIVATE_AS u32 *iv, PRIVATE_AS const u32 *data, PRIVATE_AS const u32 *Kc, PRIVATE_AS const u32 *Kd, SHM_TYPE u32 (*s_SPtrans)[64])
 {
   u32 r = data[0];

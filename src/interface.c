@@ -595,6 +595,11 @@ int hashconfig_init (hashcat_ctx_t *hashcat_ctx)
     hashconfig->opti_type &= ~OPTI_TYPE_MEET_IN_MIDDLE;
     hashconfig->opti_type &= ~OPTI_TYPE_PREPENDED_SALT;
     hashconfig->opti_type &= ~OPTI_TYPE_APPENDED_SALT;
+
+    // Only optimized kernels implement the fused salt walk. Pure kernels
+    // must retain one launch per salt.
+
+    hashconfig->opts_type &= ~OPTS_TYPE_MULTI_SALT_FUSED;
   }
 
   // In hash-info mode there is no attack to run, so what a reader is asking is which kernel types the

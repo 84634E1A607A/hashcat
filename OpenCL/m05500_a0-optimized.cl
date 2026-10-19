@@ -5,6 +5,9 @@
 
 #define NEW_SIMD_CODE
 
+// DES verification uses an incremental key schedule. Reject after DES1's
+// first word or full block before computing the remaining response words.
+
 #ifdef KERNEL_STATIC
 #include M2S(INCLUDE_PATH/inc_vendor.h)
 #include M2S(INCLUDE_PATH/inc_types.h)
@@ -64,15 +67,380 @@ DECLSPEC void transform_netntlmv1_key (const u32x w0, const u32x w1, PRIVATE_AS 
          | ((k[7] & 0xff) << 24);
 }
 
-KERNEL_FQ KERNEL_FA void m05500_m04 (KERN_ATTR_RULES ())
+// Stage at most NN_FUSE_SALTS sessions per window. Recompute each candidate's
+// MD4 once per window, then test it against the sessions in that window.
+
+#define NN_FUSE_GS(n)   ((n) + nn_base)
+#define NN_FUSE_LS(n)   ((n) - nn_base)
+#define NN_FUSE_WINS    ((NN_FUSE_TOTAL_MAX + NN_FUSE_SALTS - 1) / NN_FUSE_SALTS)
+
+// Staged indices and tail16 filters require scalar candidates.
+#if defined(NN_FUSE_SALTS) && (VECT_SIZE) > 1
+#error fused 5500 kernels are compiled for VEC=1 only
+#endif
+
+// Fusion requires shared memory for the filter bitmap and bucket index.
+#if defined(NN_FUSE_SALTS) && !defined(REAL_SHM)
+#error fused 5500 kernels stage their filter map in shared memory; build them with REAL_SHM
+#endif
+
+#if defined(NN_FUSE_SALTS)
+
+// The bitmap rejects tail16 values absent from the current window before
+// the final two MD4 steps. Bucket chains then locate the matching sessions.
+
+#define NN_FUSE_BITS_W 2048
+
+// Atomic OR preserves bits set by different threads in the same bitmap word.
+
+#if defined(IS_CUDA) || defined(IS_HIP)
+#define NN_FUSE_OR(p, v)  atomicOr ((p), (v))
+#else
+#define NN_FUSE_OR(p, v)  atomic_or ((p), (v))
+#endif
+
+// Hash tail16 into 1024 buckets. Each chain contains every session in its
+// bucket, so the walk must still compare the full tail16 value.
+
+#define NN_FUSE_TI_BUCKETS 1024
+#define NN_FUSE_TI_SHIFT   22
+#define NN_FUSE_TI_BUCKET(v) (((v) * 0x9E3779B1u) >> NN_FUSE_TI_SHIFT)
+#if defined(IS_CUDA) || defined(IS_HIP)
+#define NN_FUSE_TI_XCHG(p,v)  atomicExch ((p), (v))
+#else
+#define NN_FUSE_TI_XCHG(p,v)  atomic_xchg ((p), (v))
+#endif
+
+// Pack two 16-bit links per word. Each thread writes a complete pair to
+// avoid concurrent half-word updates. Window indices fit in 16 bits.
+
+// Default to packed links when the module enables the survivor queue.
+#ifndef NN_FUSE_DENSEQ
+#define NN_FUSE_DENSEQ 0
+#endif
+
+#ifndef NN_FUSE_TI16
+#define NN_FUSE_TI16 NN_FUSE_DENSEQ
+#endif
+
+#if NN_FUSE_TI16
+#define NN_FUSE_TI_NIL     0xffffu
+#define NN_FUSE_TI_NEXT(n) ((s_ti_next[(n) >> 1] >> (((n) & 1) << 4)) & 0xffffu)
+#define NN_FUSE_TI_W      (((NN_FUSE_SALTS) + 1) >> 1)
+#else
+#define NN_FUSE_TI_NIL     0xffffffffu
+#define NN_FUSE_TI_NEXT(n) (s_ti_next[n])
+#define NN_FUSE_TI_W      NN_FUSE_SALTS
+#endif
+
+// Queue admitted candidate/session pairs for denser DES verification.
+// The direct walk remains available when the queue is disabled or full.
+
+#if NN_FUSE_DENSEQ && NN_FUSE_TI16
+
+#define NN_FUSE_DENSEQ_ON
+
+// Each queue entry stores four NT-hash words, the window-local session
+// index, gid and rule position. Drain boundaries occur every two rules.
+
+#define NN_FUSE_QSZ 64
+#define NN_FUSE_QW  7
+
+#define NN_FUSE_DENSEQ_SEG 2
+
+#if defined(IS_CUDA) || defined(IS_HIP)
+#define NN_FUSE_QADD(p)  atomicAdd ((p), 1u)
+#else
+#define NN_FUSE_QADD(p)  atomic_inc ((p))
+#endif
+
+#endif
+
+DECLSPEC void nn_fuse_stage (SHM_TYPE u32 *s_nn_filt, SHM_TYPE u32 *s_nn_bits, GLOBAL_AS const salt_t *salt_bufs, const u32 nn_base, const u32 nn_len, const u64 lid, const u64 lsz)
+{
+  for (u32 i = lid; i < nn_len; i += lsz) s_nn_filt[i] = salt_bufs[nn_base + i].salt_buf[2];
+
+  for (u32 i = lid; i < NN_FUSE_BITS_W; i += lsz) s_nn_bits[i] = 0;
+
+  SYNC_THREADS ();
+
+  for (u32 i = lid; i < nn_len; i += lsz)
+  {
+    const u32 v = s_nn_filt[i] & 0xffff;
+
+    NN_FUSE_OR (&s_nn_bits[v >> 5], 1u << (v & 31));
+  }
+
+  SYNC_THREADS ();
+}
+
+#define NN_FUSE_FILT(i)   (s_nn_filt[i])
+#define NN_FUSE_REJECT(v) (((s_nn_bits[(v) >> 5] >> ((v) & 31)) & 1u) == 0)
+
+// The walk's per-session body, reached from the bucket and from the queue's overflow fallback,
+// so it is written once.  It is a plain block, not a do/while, because its filter test continues
+// the caller's loop.
+
+// DES round 16 leaves the first output word unchanged. Compare that word
+// after round 15 before completing DES1.
+
+// Generate each DES subkey immediately before its round to avoid storing
+// the full key schedule.
+
+#define NN_FUSE_WALK_KS(nn_key)                                                        \
+  u32x nn_ks[2];                                                                        \
+                                                                                        \
+  _des_crypt_keysetup_lm_vect_ks_init (nn_key[0], nn_key[1], nn_ks);
+
+#define NN_FUSE_WALK_DES1(nn_iv1, nn_data, nn_s)                                        \
+{                                                                                       \
+  _des_crypt_encrypt_lm_vect_ks_split (nn_iv1, nn_data, nn_ks, s_skb, s_SPtrans);         \
+                                                                                        \
+  const u32 nn_h5_cnt = salt_bufs[nn_s].digests_cnt;                                    \
+  const u32 nn_h5_off = salt_bufs[nn_s].digests_offset;                                 \
+                                                                                        \
+  u32 nn_h5_keep = 0;                                                                   \
+                                                                                        \
+  for (u32 nn_h5_d = 0; nn_h5_d < nn_h5_cnt; nn_h5_d++)                                 \
+  {                                                                                     \
+    if (nn_iv1[0] == digests_buf[nn_h5_off + nn_h5_d].digest_buf[DGST_R0])              \
+    {                                                                                   \
+      nn_h5_keep = 1;                                                                   \
+                                                                                        \
+      break;                                                                            \
+    }                                                                                   \
+  }                                                                                     \
+                                                                                        \
+  if (nn_h5_keep == 0) continue;                                                        \
+                                                                                        \
+  _des_crypt_encrypt_lm_vect_ks_finish (nn_iv1, nn_ks, s_skb, s_SPtrans);           \
+}
+
+// DES2 uses the same incremental schedule without the DES1 early reject.
+
+#define NN_FUSE_WALK_KS2(nn_key)                                                        \
+  u32x nn_ks2[2];                                                                       \
+                                                                                        \
+  _des_crypt_keysetup_lm_vect_ks_init (nn_key[0], nn_key[1], nn_ks2);
+
+#define NN_FUSE_WALK_DES2(nn_iv2, nn_data)                                              \
+  _des_crypt_encrypt_lm_vect_ks (nn_iv2, nn_data, nn_ks2, s_skb, s_SPtrans);
+
+// Reject a DES1 mismatch before constructing the DES2 key and schedule.
+
+// Non-repeating drain: the body is split from the filter test.  A drain entry was filter-tested by its own
+// producer (the enqueue is behind the same MATCHES_NONE_VS on the same two values), so the drain
+// runs NN_FUSE_WALK_ONE_NF and does not repeat the shared read and branch it already passed.
+
+// Salt buffers and hit reporting use global indices. Staged filters use
+// window-local indices, including in windows after the first.
+
+#define NN_FUSE_WALK_ONE(nn_s)                                                          \
+{                                                                                       \
+  if (MATCHES_NONE_VS (nn_dd, NN_FUSE_FILT (NN_FUSE_LS (nn_s)))) continue;              \
+                                                                                        \
+  NN_FUSE_WALK_BODY (nn_s)                                                              \
+}
+
+#define NN_FUSE_WALK_ONE_NF(nn_s)                                                       \
+{                                                                                       \
+  NN_FUSE_WALK_BODY (nn_s)                                                              \
+}
+
+// Initialize the incremental DES schedule once per admitted session.
+
+#define NN_FUSE_WALK_PREP(a, b)                                                         \
+  u32x nn_key[2];                                                                       \
+                                                                                        \
+  transform_netntlmv1_key (a, b, nn_key);                                               \
+                                                                                        \
+  NN_FUSE_WALK_KS (nn_key)
+
+#define NN_FUSE_WALK_KEY2()                                                             \
+  transform_netntlmv1_key (((b >> 24) | (c << 8)), ((c >> 24) | (d << 8)), nn_key);     \
+                                                                                        \
+  NN_FUSE_WALK_KS2 (nn_key)
+
+#define NN_FUSE_WALK_BODY(nn_s)                                                         \
+{                                                                                       \
+  const u32x nn_s0 = salt_bufs[nn_s].salt_buf[0];                                       \
+  const u32x nn_s1 = salt_bufs[nn_s].salt_buf[1];                                       \
+                                                                                        \
+  NN_FUSE_WALK_PREP (a, b)                                                              \
+                                                                                        \
+  u32x nn_data[2];                                                                      \
+                                                                                        \
+  nn_data[0] = nn_s0;                                                                   \
+  nn_data[1] = nn_s1;                                                                   \
+                                                                                        \
+  u32x nn_iv1[2];                                                                       \
+                                                                                        \
+  NN_FUSE_WALK_DES1 (nn_iv1, nn_data, nn_s)                                             \
+                                                                                        \
+  const u32 nn_digests_cnt = salt_bufs[nn_s].digests_cnt;                               \
+  const u32 nn_digests_off = salt_bufs[nn_s].digests_offset;                            \
+                                                                                        \
+  /* first-half guard: DES2 only for a first-half match. */                                       \
+  u32 nn_keep = 0;                                                                      \
+                                                                                        \
+  for (u32 nn_d = 0; nn_d < nn_digests_cnt; nn_d++)                                     \
+  {                                                                                     \
+    const u32 nn_hash_pos = nn_digests_off + nn_d;                                      \
+                                                                                        \
+    if ((nn_iv1[0] == digests_buf[nn_hash_pos].digest_buf[DGST_R0]) &&                  \
+        (nn_iv1[1] == digests_buf[nn_hash_pos].digest_buf[DGST_R1]))                    \
+    {                                                                                   \
+      nn_keep = 1;                                                                      \
+                                                                                        \
+      break;                                                                            \
+    }                                                                                   \
+  }                                                                                     \
+                                                                                        \
+  if (nn_keep == 0) continue;                                                           \
+                                                                                        \
+  NN_FUSE_WALK_KEY2 ()                                                                  \
+                                                                                        \
+  u32x nn_iv2[2];                                                                       \
+                                                                                        \
+  NN_FUSE_WALK_DES2 (nn_iv2, nn_data)                                                   \
+                                                                                        \
+  for (u32 nn_d = 0; nn_d < nn_digests_cnt; nn_d++)                                     \
+  {                                                                                     \
+    u32 digest_tp[4];                                                                   \
+                                                                                        \
+    digest_tp[0] = nn_iv1[0];                                                           \
+    digest_tp[1] = nn_iv1[1];                                                           \
+    digest_tp[2] = nn_iv2[0];                                                           \
+    digest_tp[3] = nn_iv2[1];                                                           \
+                                                                                        \
+    const u32 nn_hash_pos = nn_digests_off + nn_d;                                      \
+                                                                                        \
+    if (find_hash (digest_tp, 1, &digests_buf[nn_hash_pos]) != 0) continue;             \
+                                                                                        \
+    if (hc_atomic_inc (&hashes_shown[nn_hash_pos]) == 0)                                \
+    {                                                                                   \
+      mark_hash (plains_buf, d_return_buf, nn_s, NN_FUSE_CAP, nn_d, nn_hash_pos, gid, il_pos, 0, 0); \
+    }                                                                                   \
+  }                                                                                     \
+}
+
+#ifdef NN_FUSE_DENSEQ_ON
+
+// Capture the phase base before the barrier, since lane 0 advances it below.
+// A barrier publishes the segment's entries before any thread reads them.
+// The closing barrier prevents producers from reusing slots still being read.
+// Reservations beyond the first QSZ entries were already verified inline.
+// Per-phase ticket differences remain valid when the unsigned counter wraps.
+#define NN_FUSE_DENSEQ_DRAIN()                                                        \
+{                                                                                     \
+  const u32 nn_qbase = s_nn_qbase[0];                                                 \
+  SYNC_THREADS ();                                                                    \
+  const u32 nn_qend = s_nn_qc[0];                                                     \
+  const u32 nn_qn = min (nn_qend - nn_qbase, (u32) NN_FUSE_QSZ);                      \
+  for (u32 nn_qi = lid; nn_qi < nn_qn; nn_qi += lsz)                                  \
+  {                                                                                   \
+    const u32 nn_qb = nn_qi * NN_FUSE_QW;                                             \
+    const u64 gid = s_nn_q[nn_qb + 5];                                                \
+    const u32 il_pos = s_nn_q[nn_qb + 6];                                             \
+    const u32x a = s_nn_q[nn_qb + 0];                                                 \
+    const u32x b = s_nn_q[nn_qb + 1];                                                 \
+    const u32x c = s_nn_q[nn_qb + 2];                                                 \
+    const u32x d = s_nn_q[nn_qb + 3];                                                 \
+    const u32 nn_s = NN_FUSE_GS (s_nn_q[nn_qb + 4]);                                  \
+    NN_FUSE_WALK_ONE_NF (nn_s)                                                        \
+  }                                                                                   \
+  if (lid == 0) s_nn_qbase[0] = nn_qend;                                              \
+  SYNC_THREADS ();                                                                    \
+}
+
+#endif
+
+// Build the bucket index once per window, after staging the filter array.
+
+DECLSPEC void nn_fuse_ti_stage (SHM_TYPE u32 *s_nn_filt, SHM_TYPE u32 *s_ti_head, SHM_TYPE u32 *s_ti_next, const u32 nn_len, const u64 lid, const u64 lsz)
+{
+  for (u32 i = lid; i < NN_FUSE_TI_BUCKETS; i += lsz) s_ti_head[i] = NN_FUSE_TI_NIL;
+
+  SYNC_THREADS ();
+
+#if NN_FUSE_TI16
+
+  // One thread owns both halves of a packed word to prevent store races.
+
+  for (u32 i = lid << 1; i < nn_len; i += lsz << 1)
+  {
+    const u32 b0 = NN_FUSE_TI_BUCKET (s_nn_filt[i] & 0xffff);
+
+    const u32 n0 = NN_FUSE_TI_XCHG (&s_ti_head[b0], i);
+
+    u32 w = n0 & 0xffffu;
+
+    if ((i + 1) < nn_len)
+    {
+      const u32 b1 = NN_FUSE_TI_BUCKET (s_nn_filt[i + 1] & 0xffff);
+
+      w |= (NN_FUSE_TI_XCHG (&s_ti_head[b1], i + 1) & 0xffffu) << 16;
+    }
+    else
+    {
+      w |= (u32) NN_FUSE_TI_NIL << 16;
+    }
+
+    s_ti_next[i >> 1] = w;
+  }
+
+#else
+
+  for (u32 i = lid; i < nn_len; i += lsz)
+  {
+    const u32 b = NN_FUSE_TI_BUCKET (s_nn_filt[i] & 0xffff);
+
+    // the exchange returns the previous head, so the bucket becomes a list of every session
+    // that landed in it, in an order the block does not fix.  Every session i < NN_FUSE_SALTS
+    // is written once here, so every link the walk can follow is defined.
+
+    s_ti_next[i] = NN_FUSE_TI_XCHG (&s_ti_head[b], i);
+  }
+
+#endif
+
+  SYNC_THREADS ();
+}
+
+#endif
+
+KERNEL_FQ KERNEL_FA
+#if defined(NN_FUSE_SALTS) && (defined(IS_CUDA) || defined(IS_HIP))
+  // Limit the fused kernel register budget through its launch bounds.
+  // Volta needs a larger register budget to avoid verifier spills.
+  #if (CUDA_ARCH >= 700) && (CUDA_ARCH < 750)
+  __launch_bounds__(256, 3)
+  #else
+  __launch_bounds__(256, 4)
+  #endif
+#endif
+  void m05500_m04 (KERN_ATTR_RULES ())
 {
   /**
    * modifier
    */
 
+#ifdef NN_FUSE_SALTS
+  // Keep every thread alive for shared staging and the final queue barrier.
+  // Extra lanes repeat the last candidate. Atomic hit reporting deduplicates it.
+  const u64 gid = (get_global_id (0) < (u64) GID_CNT) ? get_global_id (0) : (u64) (GID_CNT - 1);
+#else
   const u64 gid = get_global_id (0);
+#endif
   const u64 lid = get_local_id (0);
   const u64 lsz = get_local_size (0);
+
+#ifdef NN_FUSE_SALTS
+  // fused kernel: the fused kernel covers every session in the file, so the other
+  // launches of this candidate chunk would repeat its work.  salt_pos_host 0
+  // is the launch that runs the whole search.
+  if (SALT_POS_HOST != 0) return;
+#endif
 
   /**
    * sDES_BOX, kDES_BOX
@@ -105,6 +473,22 @@ KERNEL_FQ KERNEL_FA void m05500_m04 (KERN_ATTR_RULES ())
   }
 
   SYNC_THREADS ();
+
+#ifdef NN_FUSE_SALTS
+  LOCAL_VK u32 s_nn_filt[NN_FUSE_SALTS];
+  LOCAL_VK u32 s_nn_bits[NN_FUSE_BITS_W];
+
+  LOCAL_VK u32 s_ti_head[NN_FUSE_TI_BUCKETS];
+  LOCAL_VK u32 s_ti_next[NN_FUSE_TI_W];
+
+#if defined(NN_FUSE_DENSEQ_ON)
+  LOCAL_VK u32 s_nn_q[NN_FUSE_QSZ * NN_FUSE_QW];
+  LOCAL_VK u32 s_nn_qc[1];
+  LOCAL_VK u32 s_nn_qbase[1];
+#endif
+
+  // staging and the queue reset run once per window, inside the loop below
+#endif
 
   #else
 
@@ -141,7 +525,7 @@ KERNEL_FQ KERNEL_FA void m05500_m04 (KERN_ATTR_RULES ())
   const u32 s1 = salt_bufs[SALT_POS_HOST].salt_buf[1];
   const u32 s2 = salt_bufs[SALT_POS_HOST].salt_buf[2];
 
-  u32 data[2];
+  u32x data[2];
 
   data[0] = s0;
   data[1] = s1;
@@ -150,8 +534,37 @@ KERNEL_FQ KERNEL_FA void m05500_m04 (KERN_ATTR_RULES ())
    * loop
    */
 
+#if defined(NN_FUSE_SALTS)
+  for (u32 nn_w = 0; nn_w < NN_FUSE_WINS; nn_w++)
+  {
+    const u32 nn_base = nn_w * NN_FUSE_SALTS;
+
+    // Self-test buffers contain one salt, even when the real attack is fused.
+    if (nn_base >= kernel_param->salts_cnt) break;
+
+    const u32 nn_left = kernel_param->salts_cnt - nn_base;
+    const u32 nn_len  = (nn_left < NN_FUSE_SALTS) ? nn_left : (u32) NN_FUSE_SALTS;
+
+#if defined(NN_FUSE_DENSEQ_ON)
+    if (lid == 0)
+    {
+      s_nn_qc[0] = 0;
+      s_nn_qbase[0] = 0;
+    }
+#endif
+
+    nn_fuse_stage (s_nn_filt, s_nn_bits, salt_bufs, nn_base, nn_len, lid, lsz);
+
+    nn_fuse_ti_stage (s_nn_filt, s_ti_head, s_ti_next, nn_len, lid, lsz);
+#endif
+
   for (u32 il_pos = 0; il_pos < IL_CNT; il_pos += VECT_SIZE)
   {
+#if defined(NN_FUSE_DENSEQ_ON)
+    // Every thread reaches the same segment boundary, including rejects.
+    if ((il_pos % NN_FUSE_DENSEQ_SEG) == 0) NN_FUSE_DENSEQ_DRAIN ();
+#endif
+
     u32x w0[4] = { 0 };
     u32x w1[4] = { 0 };
     u32x w2[4] = { 0 };
@@ -226,7 +639,17 @@ KERNEL_FQ KERNEL_FA void m05500_m04 (KERN_ATTR_RULES ())
     MD4_STEP (MD4_H , a, b, c, d, w0_t[3], MD4C02, MD4S20);
     MD4_STEP (MD4_H , d, a, b, c, w2_t[3], MD4C02, MD4S21);
 
+#ifdef NN_FUSE_SALTS
+    // The last two steps only update c and b. The final d already yields tail16.
+    const u32x nn_dd = (d + make_u32x (MD4M_D)) >> 16;
+
+    // Reject tails absent from this window before finishing MD4.
+    if (NN_FUSE_REJECT (nn_dd & 0xffff)) continue;
+#else
+    // upstream: abandon the candidate as soon as the 16-bit filter misses
     if (MATCHES_NONE_VS (((d + make_u32x (MD4M_D)) >> 16), s2)) continue;
+#endif
+
 
     MD4_STEP (MD4_H , c, d, a, b, w1_t[3], MD4C02, MD4S22);
     MD4_STEP (MD4_H , b, c, d, a, w3_t[3], MD4C02, MD4S23);
@@ -235,6 +658,63 @@ KERNEL_FQ KERNEL_FA void m05500_m04 (KERN_ATTR_RULES ())
     b += make_u32x (MD4M_B);
     c += make_u32x (MD4M_C);
     d += make_u32x (MD4M_D);
+
+#ifdef NN_FUSE_SALTS
+
+    // The NT hash is independent of the session. Locate matching sessions
+    // in the current window using the candidate's tail16 bucket.
+
+    // A bitmap miss skips this candidate, not the remaining rule loop.
+
+#if defined(NN_FUSE_DENSEQ_ON)
+
+    // Enqueue exact tail16 matches. If the segment queue is full, verify
+    // the pair inline instead of dropping it.
+
+    const u32 nn_ti_b = NN_FUSE_TI_BUCKET (nn_dd & 0xffff);
+
+    for (u32 nn_sl = s_ti_head[nn_ti_b]; nn_sl != NN_FUSE_TI_NIL; nn_sl = NN_FUSE_TI_NEXT (nn_sl))
+    {
+      if (MATCHES_NONE_VS (nn_dd, NN_FUSE_FILT (nn_sl))) continue;
+
+      const u32 nn_s = NN_FUSE_GS (nn_sl);
+
+      const u32 nn_qs = NN_FUSE_QADD (&s_nn_qc[0]);
+
+      const u32 nn_qi = nn_qs - s_nn_qbase[0];
+
+      if (nn_qi < NN_FUSE_QSZ)
+      {
+        const u32 nn_qb = nn_qi * NN_FUSE_QW;
+
+        s_nn_q[nn_qb + 0] = a;
+        s_nn_q[nn_qb + 1] = b;
+        s_nn_q[nn_qb + 2] = c;
+        s_nn_q[nn_qb + 3] = d;
+        s_nn_q[nn_qb + 4] = nn_sl;
+        s_nn_q[nn_qb + 5] = (u32) gid;
+        s_nn_q[nn_qb + 6] = (u32) il_pos;
+      }
+      else
+      {
+        NN_FUSE_WALK_ONE_NF (nn_s)
+      }
+    }
+
+#else
+
+    // Walk the complete bucket and verify each exact tail16 match inline.
+
+    const u32 nn_ti_b = NN_FUSE_TI_BUCKET (nn_dd & 0xffff);
+
+    for (u32 nn_sl = s_ti_head[nn_ti_b]; nn_sl != NN_FUSE_TI_NIL; nn_sl = NN_FUSE_TI_NEXT (nn_sl))
+    {
+      NN_FUSE_WALK_ONE (NN_FUSE_GS (nn_sl))
+    }
+
+#endif
+
+#else
 
     /**
      * DES1
@@ -248,11 +728,6 @@ KERNEL_FQ KERNEL_FA void m05500_m04 (KERN_ATTR_RULES ())
     u32x Kd[16];
 
     _des_crypt_keysetup_lm_vect (key[0], key[1], Kc, Kd, s_skb);
-
-    u32x data[2];
-
-    data[0] = s0;
-    data[1] = s1;
 
     u32x iv1[2];
 
@@ -275,7 +750,22 @@ KERNEL_FQ KERNEL_FA void m05500_m04 (KERN_ATTR_RULES ())
      */
 
     COMPARE_M_SIMD (iv1[0], iv1[1], iv2[0], iv2[1]);
+
+#endif
   }
+
+#if defined(NN_FUSE_DENSEQ_ON)
+
+    // Every thread must reach the final drain, including bitmap rejects.
+
+    NN_FUSE_DENSEQ_DRAIN ();
+
+#endif
+#if defined(NN_FUSE_SALTS)
+    // before the next window stages over the arrays the walk was reading
+    SYNC_THREADS ();
+  }
+#endif
 }
 
 KERNEL_FQ KERNEL_FA void m05500_m08 (KERN_ATTR_RULES ())

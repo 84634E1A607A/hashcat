@@ -3349,8 +3349,38 @@ DECLSPEC u32 apply_rules_optimized (CONSTANT_AS const u32 *cmds, PRIVATE_AS u32 
     const u32 p0   = (cmd >>  8) & 0xff;
     const u32 p1   = (cmd >> 16) & 0xff;
 
-    // we need to guarantee input length < 32 otherwise functions like rule_op_mangle_switch_last() and others will read out of boundary
+    // Keep the common-opcode fast path local to the fused 5500 CUDA kernel.
+    // Other shapes retain the common rule dispatcher.
+    #if defined(NN_FUSE_SALTS) && defined(IS_CUDA)
+
+    if (name == RULE_OP_MANGLE_APPEND)
+    {
+      out_len = rule_op_mangle_append (p0, p1, buf0, buf1, out_len);
+    }
+    else if (name == RULE_OP_MANGLE_OVERSTRIKE)
+    {
+      out_len = rule_op_mangle_overstrike (p0, p1, buf0, buf1, out_len);
+    }
+    else if (name == RULE_OP_MANGLE_INSERT)
+    {
+      out_len = rule_op_mangle_insert (p0, p1, buf0, buf1, out_len);
+    }
+    else if (name == RULE_OP_MANGLE_PREPEND)
+    {
+      out_len = rule_op_mangle_prepend (p0, p1, buf0, buf1, out_len);
+    }
+    else
+    {
+      // we need to guarantee input length < 32 otherwise functions like rule_op_mangle_switch_last() and others will read out of boundary
+      out_len = apply_rule_optimized (name, p0, p1, buf0, buf1, out_len);
+    }
+
+    #else
+
+    // Rule operations require an input length below 32 bytes.
     out_len = apply_rule_optimized (name, p0, p1, buf0, buf1, out_len);
+
+    #endif
   }
 
   return out_len;

@@ -150,16 +150,51 @@ KERNEL_FQ KERNEL_FA void m05500_mxx (KERN_ATTR_VECTOR ())
   /**
    * loop
    */
+#if defined (AMP_TAIL) && (AMP_TAIL == 1)
+
+  // AMP_TAIL enables tail placement for the queue. amp_dst selects the
+  // current mask's byte offset, with zero retaining head placement.
+
+  const u32 amp_dst = (u32) kernel_param->amp_dst;
+
+  const u32 amp_w   = amp_dst / 4;
+  const u32 amp_shl = (amp_dst % 4) * 8;
+
+#endif
 
   u32x w0l = w[0];
+#if defined (AMP_TAIL) && (AMP_TAIL == 1)
+
+  // The two words the amplifier word spreads over also hold mask characters above and below it, and
+  // this buffer lives across candidates: an OR into the live buffer would carry one candidate's
+  // characters into the next candidate's password, so the mask's own bytes are saved once here and
+  // re-applied per candidate. A single word merged at the front is assigned, never accumulated.
+
+  const u32x amp_base_lo = (amp_dst == 0) ? 0 : w[amp_w];
+  const u32x amp_base_hi = (amp_dst == 0) ? 0 : w[amp_w + 1];
+
+#endif
 
   for (u32 il_pos = 0; il_pos < IL_CNT; il_pos += VECT_SIZE)
   {
     const u32x w0r = words_buf_r[il_pos / VECT_SIZE];
+#if defined (AMP_TAIL) && (AMP_TAIL == 1)
+
+    if (amp_dst == 0)
+    {
+      w[0] = w0l | w0r;
+    }
+    else
+    {
+      w[amp_w    ] = amp_base_lo | (w0r << amp_shl);
+      w[amp_w + 1] = (amp_shl == 0) ? amp_base_hi : (amp_base_hi | (w0r >> (32 - amp_shl)));
+    }
+#else
 
     const u32x w0 = w0l | w0r;
 
     w[0] = w0;
+#endif
 
     #if VECT_SIZE == 1
 
@@ -358,16 +393,51 @@ KERNEL_FQ KERNEL_FA void m05500_sxx (KERN_ATTR_VECTOR ())
   /**
    * loop
    */
+#if defined (AMP_TAIL) && (AMP_TAIL == 1)
+
+  // AMP_TAIL enables tail placement for the queue. amp_dst selects the
+  // current mask's byte offset, with zero retaining head placement.
+
+  const u32 amp_dst = (u32) kernel_param->amp_dst;
+
+  const u32 amp_w   = amp_dst / 4;
+  const u32 amp_shl = (amp_dst % 4) * 8;
+
+#endif
 
   u32x w0l = w[0];
+#if defined (AMP_TAIL) && (AMP_TAIL == 1)
+
+  // The two words the amplifier word spreads over also hold mask characters above and below it, and
+  // this buffer lives across candidates: an OR into the live buffer would carry one candidate's
+  // characters into the next candidate's password, so the mask's own bytes are saved once here and
+  // re-applied per candidate. A single word merged at the front is assigned, never accumulated.
+
+  const u32x amp_base_lo = (amp_dst == 0) ? 0 : w[amp_w];
+  const u32x amp_base_hi = (amp_dst == 0) ? 0 : w[amp_w + 1];
+
+#endif
 
   for (u32 il_pos = 0; il_pos < IL_CNT; il_pos += VECT_SIZE)
   {
     const u32x w0r = words_buf_r[il_pos / VECT_SIZE];
+#if defined (AMP_TAIL) && (AMP_TAIL == 1)
+
+    if (amp_dst == 0)
+    {
+      w[0] = w0l | w0r;
+    }
+    else
+    {
+      w[amp_w    ] = amp_base_lo | (w0r << amp_shl);
+      w[amp_w + 1] = (amp_shl == 0) ? amp_base_hi : (amp_base_hi | (w0r >> (32 - amp_shl)));
+    }
+#else
 
     const u32x w0 = w0l | w0r;
 
     w[0] = w0;
+#endif
 
     #if VECT_SIZE == 1
 

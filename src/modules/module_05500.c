@@ -5,10 +5,12 @@
 
 #include "common.h"
 #include "types.h"
+#include "thread.h"
 #include "modules.h"
 #include "bitops.h"
 #include "convert.h"
 #include "shared.h"
+#include "memory.h"
 #include "parser.h"
 #include "emu_inc_cipher_des.h"
 #include "emu_inc_hash_md5.h"
@@ -24,10 +26,12 @@ static const char *HASH_NAME      = "NetNTLMv1 / NetNTLMv1+ESS";
 static const u64   KERN_TYPE      = 5500;
 static const u32   OPTI_TYPE      = OPTI_TYPE_ZERO_BYTE;
 static const u64   OPTS_TYPE      = OPTS_TYPE_STOCK_MODULE
+                                  | OPTS_TYPE_MULTI_SALT_FUSED
                                   | OPTS_TYPE_PT_GENERATE_LE
                                   | OPTS_TYPE_PT_ADD80
                                   | OPTS_TYPE_PT_ADDBITS14
                                   | OPTS_TYPE_PT_UTF16LE
+                                  | OPTS_TYPE_AMP_TAIL
                                   | OPTS_TYPE_ST_HEX;
 static const u32   SALT_TYPE      = SALT_TYPE_EMBEDDED;
 static const char *ST_PASS        = "hashcat";
@@ -81,20 +85,452 @@ static void transform_netntlmv1_key (const u8 *nthash, u8 *key)
   key[7] |= 0x01;
 }
 
-char *module_jit_build_options (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED const user_options_t *user_options, MAYBE_UNUSED const user_options_extra_t *user_options_extra, MAYBE_UNUSED const hashes_t *hashes, MAYBE_UNUSED const hc_device_param_t *device_param)
+// Tail-key schedules depend only on the suffix. Reuse them across records.
+
+#define NN_TAIL_SCHED_ENTRIES 0x10000
+#define NN_TAIL_SCHED_WORDS   32
+
+static u32 *nn_tail_sched = NULL;
+
+// Serialize shared schedule initialization and scan publishers across contexts.
+
+static hc_thread_mutex_t nn_tail_lock;
+
+static void __attribute__ ((constructor)) nn_tail16_init (void)
+{
+  hc_thread_mutex_init (nn_tail_lock);
+}
+
+static void nn_tail_sched_build (void)
+{
+  if (nn_tail_sched != NULL) return;
+
+  u32 *sched = (u32 *) hcmalloc ((size_t) NN_TAIL_SCHED_ENTRIES * NN_TAIL_SCHED_WORDS * sizeof (u32));
+
+  for (u32 i = 0; i < NN_TAIL_SCHED_ENTRIES; i++)
+  {
+    u32 key_md4[2] = { 0 };
+    u32 key_des[2] = { 0 };
+
+    key_md4[0] = i;
+
+    transform_netntlmv1_key ((const u8 *) key_md4, (u8 *) key_des);
+
+    u32 *Kc = &sched[(size_t) i * NN_TAIL_SCHED_WORDS];
+    u32 *Kd = &Kc[16];
+
+    _des_crypt_keysetup (key_des[0], key_des[1], Kc, Kd, (u32 (*)[64]) c_skb);
+  }
+
+  nn_tail_sched = sched;
+}
+
+// Workers scan disjoint suffix ranges and atomically lower the best match.
+// Return the lowest matching suffix, preserving the serial scan's result.
+// A worker can stop once its cursor reaches the shared best suffix.
+
+#define NN_TAIL16_SCAN_THREADS_MAX 32
+
+typedef struct nn_tail16_job
+{
+  u32 lo;
+  u32 hi;
+  const u32 *sched;
+  u32 block[2];
+  u32 want[2];
+  u64 *best;
+
+  u64 mine;
+
+} nn_tail16_job_t;
+
+// Reuse worker threads across records to avoid per-record create/join overhead.
+
+typedef struct nn_tail16_pool
+{
+  u32 threads;
+  u32 started;
+
+  hc_thread_t tid[NN_TAIL16_SCAN_THREADS_MAX];
+
+  hc_thread_mutex_t lock;
+  hc_thread_cond_t  go;
+  hc_thread_cond_t  done_cond;
+  hc_thread_cond_t  parked_cond;
+
+  u32 gen;
+  u32 parked;
+  u32 finished;
+  bool stop;
+
+  nn_tail16_job_t job[NN_TAIL16_SCAN_THREADS_MAX];
+  u64 best;
+
+} nn_tail16_pool_t;
+
+static nn_tail16_pool_t *nn_tail16_pool = NULL;
+
+static u32 nn_tail16_scan_threads_env (void)
+{
+  i32 n = NN_TAIL16_SCAN_THREADS_MAX;
+
+  const char *env = getenv ("NN_TAIL16_SCAN_THREADS");
+
+  if (env != NULL) n = atoi (env);
+
+  if (n > NN_TAIL16_SCAN_THREADS_MAX) n = NN_TAIL16_SCAN_THREADS_MAX;
+  if (n < 0)                            n = 0;
+
+  return n;
+}
+
+// Stop higher slices early when another worker finds a lower matching suffix.
+
+static void nn_tail16_scan_slice (nn_tail16_job_t *job)
+{
+  job->mine = (u64) -1;
+
+  for (u32 i = job->lo; i < job->hi; i++)
+  {
+    if (((i - job->lo) & 0x3f) == 0)
+    {
+      const u64 seen = __atomic_load_n (job->best, __ATOMIC_RELAXED);
+
+      if (seen <= (u64) i) return;
+    }
+
+    u32 Kc[16] = { 0 };
+    u32 Kd[16] = { 0 };
+
+    const u32 *s = &job->sched[(size_t) i * NN_TAIL_SCHED_WORDS];
+
+    for (u32 k = 0; k < 16; k++)
+    {
+      Kc[k] = s[k +  0];
+      Kd[k] = s[k + 16];
+    }
+
+    u32 data3[2] = { job->block[0], job->block[1] };
+
+    _des_crypt_encrypt (data3, data3, Kc, Kd, (u32 (*)[64]) c_SPtrans);
+
+    if (data3[0] != job->want[0]) continue;
+    if (data3[1] != job->want[1]) continue;
+
+    job->mine = i;
+
+    u64 cur = __atomic_load_n (job->best, __ATOMIC_RELAXED);
+
+    while ((u64) i < cur)
+    {
+      if (__atomic_compare_exchange_n (job->best, &cur, (u64) i, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED) == 1) break;
+    }
+
+    return;
+  }
+}
+
+typedef struct nn_tail16_worker
+{
+  nn_tail16_pool_t *pool;
+  u32 idx;
+
+} nn_tail16_worker_t;
+
+static nn_tail16_worker_t nn_tail16_workers[NN_TAIL16_SCAN_THREADS_MAX];
+
+static HC_THREAD_FUNC nn_tail16_worker (void *p)
+{
+  nn_tail16_worker_t *self = (nn_tail16_worker_t *) p;
+  nn_tail16_pool_t   *pool = self->pool;
+
+  for (;;)
+  {
+    hc_thread_mutex_lock (pool->lock);
+
+    const u32 mygen = pool->gen;
+
+    pool->parked++;
+
+    hc_thread_cond_signal (pool->parked_cond);
+
+    while ((pool->gen == mygen) && (pool->stop == false))
+    {
+      hc_thread_cond_wait (pool->go, pool->lock);
+    }
+
+    if (pool->stop == true)
+    {
+      pool->parked--;
+
+      hc_thread_mutex_unlock (pool->lock);
+
+      return 0;
+    }
+
+    pool->parked--;
+
+    hc_thread_mutex_unlock (pool->lock);
+
+    nn_tail16_scan_slice (&pool->job[self->idx]);
+
+    hc_thread_mutex_lock (pool->lock);
+
+    pool->finished++;
+
+    hc_thread_cond_signal (pool->done_cond);
+
+    hc_thread_mutex_unlock (pool->lock);
+  }
+
+  return 0;
+}
+
+// The caller holds nn_tail_lock until every worker reports its result.
+
+static u64 nn_tail16_pool_run (nn_tail16_pool_t *pool, const u32 *sched, const u32 block0, const u32 block1, const u32 want0, const u32 want1)
+{
+  hc_thread_mutex_lock (pool->lock);
+
+  while (pool->parked < pool->threads)
+  {
+    hc_thread_cond_wait (pool->parked_cond, pool->lock);
+  }
+
+  u64 best = (u64) -1;
+
+  const u32 chunk = (0x10000 + pool->threads - 1) / pool->threads;
+
+  for (u32 k = 0; k < pool->threads; k++)
+  {
+    const u32 lo = (u32) k * chunk;
+
+    u32 hi = lo + chunk;
+
+    if (hi > 0x10000) hi = 0x10000;
+
+    pool->job[k].lo       = lo;
+    pool->job[k].hi       = hi;
+    pool->job[k].sched    = sched;
+    pool->job[k].block[0] = block0;
+    pool->job[k].block[1] = block1;
+    pool->job[k].want[0]  = want0;
+    pool->job[k].want[1]  = want1;
+    pool->job[k].best     = &pool->best;
+    pool->job[k].mine     = (u64) -1;
+  }
+
+  pool->best     = (u64) -1;
+  pool->finished = 0;
+  pool->gen++;
+
+  hc_thread_cond_broadcast (pool->go);
+
+  while (pool->finished < pool->threads)
+  {
+    hc_thread_cond_wait (pool->done_cond, pool->lock);
+  }
+
+  best = pool->best;
+
+  hc_thread_mutex_unlock (pool->lock);
+
+  return best;
+}
+
+static nn_tail16_pool_t *nn_tail16_pool_get (void)
+{
+  static bool nn_tried = false;
+
+  if (nn_tried == true) return nn_tail16_pool;
+
+  nn_tried = true;
+
+  const u32 threads = nn_tail16_scan_threads_env ();
+
+  if (threads <= 1) return NULL;
+
+  nn_tail16_pool_t *pool = (nn_tail16_pool_t *) hcmalloc (sizeof (nn_tail16_pool_t));
+
+  memset (pool, 0, sizeof (nn_tail16_pool_t));
+
+  pool->threads = threads;
+
+  hc_thread_mutex_init (pool->lock);
+  hc_thread_cond_init  (pool->go);
+  hc_thread_cond_init  (pool->done_cond);
+  hc_thread_cond_init  (pool->parked_cond);
+
+  for (u32 k = 0; k < threads; k++)
+  {
+    nn_tail16_workers[k].pool = pool;
+    nn_tail16_workers[k].idx  = k;
+
+    hc_thread_t tid;
+
+    if (hc_thread_create_ok (tid, nn_tail16_worker, &nn_tail16_workers[k]) == 0)
+    {
+      // Partition future scans among the workers that actually started.
+
+      pool->threads = k;
+
+      break;
+    }
+
+    pool->tid[k] = tid;
+    pool->started = k + 1;
+  }
+
+  if (pool->threads <= 1)
+  {
+    // The caller scans serially when fewer than two workers started.
+
+    pool->threads = 1;
+  }
+
+  nn_tail16_pool = pool;
+
+  return pool;
+}
+
+// Join workers before dlclose unmaps the module code they are waiting in.
+
+static void nn_tail16_pool_shutdown (void)
+{
+  nn_tail16_pool_t *pool = nn_tail16_pool;
+
+  if (pool == NULL) return;
+
+  hc_thread_mutex_lock (pool->lock);
+
+  pool->stop = true;
+
+  pool->gen++;
+
+  hc_thread_cond_broadcast (pool->go);
+
+  hc_thread_mutex_unlock (pool->lock);
+
+  for (u32 k = 0; k < pool->started; k++)
+  {
+    hc_thread_join (pool->tid[k]);
+  }
+
+  hc_thread_cond_delete (pool->parked_cond);
+  hc_thread_cond_delete (pool->done_cond);
+  hc_thread_cond_delete (pool->go);
+  hc_thread_mutex_delete (pool->lock);
+
+  hcfree (pool);
+
+  nn_tail16_pool = NULL;
+}
+
+static void __attribute__ ((destructor)) nn_tail16_pool_fini (void)
+{
+  nn_tail16_pool_shutdown ();
+
+  hcfree (nn_tail_sched);
+
+  nn_tail_sched = NULL;
+
+  hc_thread_mutex_delete (nn_tail_lock);
+}
+
+// Preserve the serial scan's lowest matching suffix, or return (u64) -1.
+
+static u64 nn_tail16_scan (const u32 *sched, const u32 block0, const u32 block1, const u32 want0, const u32 want1)
+{
+  hc_thread_mutex_lock (nn_tail_lock);
+
+  nn_tail16_pool_t *pool = nn_tail16_pool_get ();
+
+  if ((pool == NULL) || (pool->threads <= 1))
+  {
+    u64 best = (u64) -1;
+
+    nn_tail16_job_t job;
+
+    job.lo       = 0;
+    job.hi       = 0x10000;
+    job.sched    = sched;
+    job.block[0] = block0;
+    job.block[1] = block1;
+    job.want[0]  = want0;
+    job.want[1]  = want1;
+    job.best     = &best;
+
+    nn_tail16_scan_slice (&job);
+
+    hc_thread_mutex_unlock (nn_tail_lock);
+
+    return job.mine;
+  }
+
+  const u64 best = nn_tail16_pool_run (pool, sched, block0, block1, want0, want1);
+
+  hc_thread_mutex_unlock (nn_tail_lock);
+
+  return best;
+}
+
+char *module_jit_build_options(MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED const user_options_t *user_options, MAYBE_UNUSED const user_options_extra_t *user_options_extra, MAYBE_UNUSED const hashes_t *hashes, MAYBE_UNUSED const hc_device_param_t *device_param)
 {
   char *jit_build_options = NULL;
 
-  // Extra treatment for Apple systems
-  if (device_param->opencl_platform_vendor_id == VENDOR_ID_APPLE)
+  // The single-digest CUDA mask kernel rarely reaches DES. Constant tables
+  // avoid shared-table initialization and its block barrier.
+
+  const bool mask_kernel = ((hashconfig->opti_type & OPTI_TYPE_OPTIMIZED_KERNEL) != 0) && (user_options->attack_mode == ATTACK_MODE_BF) && (hashes->digests_cnt == 1) && (device_param->is_cuda == true);
+
+  // Keep this predicate equal to run_cracker_salt_major. Pure kernels have
+  // OPTS_TYPE_MULTI_SALT_FUSED cleared by interface.c.
+  // Generic host generators also use the straight kernel. Association uses
+  // the same kernel but pairs each candidate with one salt, so exclude it.
+  // CUDA stages 4096 sessions on sm_80 and later, or 512 on older devices.
+  // OpenCL and HIP use 1536 without a queue: 28 KiB leaves 4 KiB spare on
+  // devices with 32 KiB local memory. Larger inputs use multiple windows.
+  // TODO: Above 32 KiB, derive window candidates from runtime local-memory
+  // capacity and autotune them online instead of using the fixed limit.
+
+  char fuse_str[192] = "";
+
+  const bool fuse_attack = ((user_options_extra->attack_kern == ATTACK_KERN_BF) || (user_options_extra->attack_kern == ATTACK_KERN_STRAIGHT)) && (user_options->attack_mode != ATTACK_MODE_ASSOCIATION);
+  const bool fuse_device = ((device_param->is_cuda == true) && (device_param->sm_major >= 5)) || (device_param->is_opencl == true) || (device_param->is_hip == true);
+  const bool fuse_salts = ((hashconfig->opts_type & OPTS_TYPE_MULTI_SALT_FUSED) != 0) && (fuse_attack == true) && (hashes->salts_cnt > 1) && (device_param->vector_width == 1) && (fuse_device == true);
+
+  // Fused kernels require REAL_SHM. FORCE_DISABLE_SHM only applies to
+  // single-digest mask runs, so it cannot overlap with fusion.
+
+  if (fuse_salts == true)
   {
-    return jit_build_options;
+    const u32 nn_cuda_max = (device_param->sm_major >= 8) ? 4096 : 512;
+    const u32 nn_max = (device_param->is_cuda == true) ? nn_cuda_max : 1536;
+    const u32 nn_win = (hashes->salts_cnt < nn_max) ? (const u32) hashes->salts_cnt : nn_max;
+
+    snprintf (fuse_str, sizeof (fuse_str), " -D NN_FUSE_SALTS=%u -D NN_FUSE_TOTAL_MAX=%u -D NN_FUSE_CAP=%u", nn_win, (const u32) hashes->salts_cnt, (const u32) hashes->digests_cnt);
+
+    // CUDA straight kernels use a survivor queue at 256 salts and above.
+    // Keep other backends on the direct walk to stay within the 28 KiB budget.
+    // The mask kernel ignores this define.
+    if ((device_param->is_cuda == true) && (hashes->salts_cnt >= 256))
+    {
+      strncat (fuse_str, " -D NN_FUSE_DENSEQ", sizeof (fuse_str) - strlen (fuse_str) - 1);
+    }
   }
 
   // Intel CPU
   if ((device_param->opencl_device_vendor_id == VENDOR_ID_INTEL_SDK) && (device_param->opencl_device_type & CL_DEVICE_TYPE_CPU))
   {
-    hc_asprintf (&jit_build_options, "-D _unroll");
+    hc_asprintf (&jit_build_options, mask_kernel ? "-D _unroll -D FORCE_DISABLE_SHM%s" : "-D _unroll%s", fuse_str);
+  }
+  else if (mask_kernel == true)
+  {
+    hc_asprintf (&jit_build_options, "-D FORCE_DISABLE_SHM%s", fuse_str);
+  }
+  else if (fuse_str[0] != 0)
+  {
+    hc_asprintf (&jit_build_options, "%s", fuse_str + 1);
   }
 
   return jit_build_options;
@@ -285,33 +721,17 @@ int module_hash_decode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSE
 
   /* precompute netntlmv1 exploit start */
 
-  for (u32 i = 0; i < 0x10000; i++)
-  {
-    u32 key_md4[2] = { 0 };
-    u32 key_des[2] = { 0 };
+  const u32 *nn_sched = nn_tail_sched;
 
-    key_md4[0] = i;
+  const u64 nn_tail16 = nn_tail16_scan (nn_sched, salt->salt_buf[0], salt->salt_buf[1], digest_tmp[0], digest_tmp[1]);
 
-    transform_netntlmv1_key ((const u8 *) key_md4, (u8 *) key_des);
+  // No recovered tail key means the response does not fit the effective challenge.
 
-    u32 Kc[16] = { 0 };
-    u32 Kd[16] = { 0 };
+  if (nn_tail16 == (u64) -1) return (PARSER_SALT_VALUE);
 
-    _des_crypt_keysetup (key_des[0], key_des[1], Kc, Kd, (u32 (*)[64]) c_skb);
+  salt->salt_buf[2] = (u32) nn_tail16;
 
-    u32 data3[2] = { salt->salt_buf[0], salt->salt_buf[1] };
-
-    _des_crypt_encrypt (data3, data3, Kc, Kd, (u32 (*)[64]) c_SPtrans);
-
-    if (data3[0] != digest_tmp[0]) continue;
-    if (data3[1] != digest_tmp[1]) continue;
-
-    salt->salt_buf[2] = i;
-
-    salt->salt_len = 24;
-
-    break;
-  }
+  salt->salt_len = 24;
 
   salt->salt_buf_pc[0] = digest_tmp[0];
   salt->salt_buf_pc[1] = digest_tmp[1];
@@ -410,6 +830,19 @@ int module_hash_encode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSE
   return out_len;
 }
 
+int module_hash_init_selftest (MAYBE_UNUSED const hashconfig_t *hashconfig, hash_t *hash)
+{
+  // Synthetic self-test and benchmark salts bypass the hash sorter. The
+  // fused verifier needs the same one-digest range that the sorter supplies.
+
+  const int parser_status = module_hash_decode (hashconfig, hash->digest, hash->salt, hash->esalt, hash->hook_salt, hash->hash_info, hashconfig->st_hash, strlen (hashconfig->st_hash));
+
+  hash->salt->digests_cnt    = 1;
+  hash->salt->digests_offset = 0;
+
+  return parser_status;
+}
+
 void module_init (module_ctx_t *module_ctx)
 {
   module_ctx->module_context_size             = MODULE_CONTEXT_SIZE_CURRENT;
@@ -448,7 +881,7 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_hash_encode_potfile      = MODULE_DEFAULT;
   module_ctx->module_hash_encode              = module_hash_encode;
   module_ctx->module_hash_hints               = MODULE_DEFAULT;
-  module_ctx->module_hash_init_selftest       = MODULE_DEFAULT;
+  module_ctx->module_hash_init_selftest       = module_hash_init_selftest;
   module_ctx->module_hash_mode                = MODULE_DEFAULT;
   module_ctx->module_hash_category            = module_hash_category;
   module_ctx->module_hash_name                = module_hash_name;
@@ -494,4 +927,12 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_unstable_warning         = MODULE_DEFAULT;
   module_ctx->module_usage_notice             = MODULE_DEFAULT;
   module_ctx->module_warmup_disable           = MODULE_DEFAULT;
+
+  // Build the shared schedule before parsing any hash records.
+
+  hc_thread_mutex_lock (nn_tail_lock);
+
+  nn_tail_sched_build ();
+
+  hc_thread_mutex_unlock (nn_tail_lock);
 }
